@@ -11,6 +11,7 @@ use tinc_device::{Device, GroBucket, GroVerdict};
 use crate::inthash::IntHashMap;
 use crate::local_addr;
 use crate::shard::TunnelHandles;
+use crate::subnet_tree::SubnetTree;
 use crate::tunnel::TunnelState;
 
 use super::ListenerSlot;
@@ -26,16 +27,27 @@ const UDP_UNREACHABLE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 ///
 /// Gates on `cached.is_none() OR addr changed` — not just addr-change —
 /// because gossip seeds `udp_addr` while clearing `udp_addr_cached`.
+///
+/// A source inside the mesh's own Subnets is a datagram that came
+/// through the tunnel (see `daemon::endpoint`); it is authenticated
+/// and processed, but never becomes the peer's endpoint. Checked
+/// after the steady-state early return so the per-packet cost is nil.
 pub(super) fn confirm_udp_addr(
     tunnels: &mut IntHashMap<NodeId, TunnelState>,
     listeners: &[ListenerSlot],
     tunnel_handles: &IntHashMap<NodeId, Arc<TunnelHandles>>,
+    subnets: &SubnetTree,
     nid: NodeId,
     from_name: &str,
     peer_addr: SocketAddr,
 ) {
     let tunnel = tunnels.entry(nid).or_default();
     if tunnel.udp_addr_cached.is_some() && tunnel.udp_addr == Some(peer_addr) {
+        return;
+    }
+    if subnets.covers(peer_addr.ip()) {
+        log::debug!(target: "tincd::net",
+                    "Ignoring UDP address {peer_addr} for {from_name} (datagram source): inside the VPN");
         return;
     }
     let listener_addrs: Vec<SocketAddr> = listeners.iter().map(|s| s.listener.local).collect();
@@ -210,6 +222,46 @@ mod tests {
         }
         let e = io::Error::other("synthetic");
         assert!(!is_udp_unreachable_errno(&e));
+    }
+
+    /// A datagram whose source is a tunnel address never becomes the
+    /// peer's endpoint, even on the first (uncached) packet; a LAN
+    /// source does.
+    #[test]
+    fn confirm_udp_addr_ignores_tunnel_sources() {
+        let mut tunnels: IntHashMap<NodeId, TunnelState> = IntHashMap::default();
+        let tunnel_handles: IntHashMap<NodeId, Arc<TunnelHandles>> = IntHashMap::default();
+        let mut subnets = SubnetTree::new();
+        subnets.add("42:0:ce16::113/128".parse().unwrap(), "bob".into());
+        let nid = NodeId(7);
+
+        let tun_src: SocketAddr = "[42:0:ce16::113]:35710".parse().unwrap();
+        confirm_udp_addr(
+            &mut tunnels,
+            &[],
+            &tunnel_handles,
+            &subnets,
+            nid,
+            "bob",
+            tun_src,
+        );
+        let t = tunnels.get(&nid).expect("entry created");
+        assert!(t.udp_addr.is_none(), "tunnel source must not be learnt");
+        assert!(!t.status.udp_confirmed);
+
+        let lan_src: SocketAddr = "10.79.131.61:40483".parse().unwrap();
+        confirm_udp_addr(
+            &mut tunnels,
+            &[],
+            &tunnel_handles,
+            &subnets,
+            nid,
+            "bob",
+            lan_src,
+        );
+        let t = tunnels.get(&nid).unwrap();
+        assert_eq!(t.udp_addr, Some(lan_src));
+        assert!(t.status.udp_confirmed);
     }
 
     #[test]
