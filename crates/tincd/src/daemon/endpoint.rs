@@ -61,7 +61,9 @@ impl Daemon {
 
     /// Stash `addr` as `nid`'s UDP endpoint (unconfirmed; the next
     /// probe decides). Refused, with a debug line naming `source`,
-    /// when it is a tunnel address. Returns whether it was taken.
+    /// when it is a tunnel address or `nid`'s UDP path is confirmed
+    /// ([`crate::tunnel::TunnelState::take_udp_hint`]). Returns
+    /// whether it was taken.
     pub(crate) fn learn_udp_addr(&mut self, nid: NodeId, addr: SocketAddr, source: &str) -> bool {
         if self.is_tunnel_addr(addr.ip()) {
             let name = self.graph.node(nid).map_or("<gone>", |n| n.name.as_str());
@@ -69,9 +71,12 @@ impl Daemon {
                         "Ignoring UDP address {addr} for {name} ({source}): inside the VPN");
             return false;
         }
-        let t = self.dp.tunnels.entry(nid).or_default();
-        t.udp_addr = Some(addr);
-        t.udp_addr_cached = None; // stale: new candidate supersedes
-        true
+        if self.dp.tunnels.entry(nid).or_default().take_udp_hint(addr) {
+            return true;
+        }
+        let name = self.graph.node(nid).map_or("<gone>", |n| n.name.as_str());
+        log::debug!(target: "tincd::net",
+                    "Ignoring UDP address {addr} for {name} ({source}): UDP path confirmed");
+        false
     }
 }

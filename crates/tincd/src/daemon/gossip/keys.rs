@@ -428,10 +428,10 @@ impl Daemon {
         hint_nw |= self.send_udp_info(from_nid, &msg.from, true);
 
         // Punch coordination, responder side: stash the reflexive address a relay may
-        // have appended (REQ_KEY arrives before validkey, unlike ANS_KEY). A lying
-        // relay can already drop our handshake; worst case here is one probe to a
-        // wrong address, since `udp_confirmed` needs an authenticated reply. Same
-        // trust as ADD_EDGE's unauthenticated address.
+        // have appended (REQ_KEY arrives before validkey, unlike ANS_KEY). Ignored
+        // while the UDP path is confirmed, so a rekey keeps the working address;
+        // otherwise worst case is probes to a wrong address, since `udp_confirmed`
+        // needs an authenticated reply. Same trust as ADD_EDGE's address.
         if let Some((addr_s, port_s)) = &msg.udp_addr
             && let Some(addr) = local_addr::parse_addr_port(addr_s.as_str(), port_s.as_str())
             && self.learn_udp_addr(from_nid, addr, "REQ_KEY")
@@ -603,8 +603,9 @@ impl Daemon {
             .dispatch_tunnel_outputs(from_nid, &msg.from, outs)
             .needs_write;
 
-        // Two gates - validkey (set above on HandshakeDone; without
-        // it the addr could be a replay) + relay appended one.
+        // Gates: validkey (set above on HandshakeDone; without it
+        // the addr could be a replay), a relay appended one, and
+        // `learn_udp_addr` (no tunnel address, no confirmed path).
         if let Some((addr_s, port_s)) = &msg.udp_addr {
             let validkey = self
                 .dp
