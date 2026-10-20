@@ -23,3 +23,4 @@ mod stress;
 mod tcp_fallback;
 mod tunnel_addr;
 mod udp_asymmetric;
+mod udp_relayed_keepalive;
