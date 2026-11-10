@@ -151,6 +151,27 @@ impl UdpPath {
         self.target = None;
     }
 
+    /// A seen address proves only the peer→us leg. Once our probes to it
+    /// went unanswered for `timeout` (a flushed NAT mapping, a rewritten
+    /// source), it is no better than a hint: release it so edge addresses
+    /// are explored and hints may replace it. Returns whether it was released.
+    pub(crate) fn release_unanswered_seen(&mut self, now: Instant, timeout: Duration) -> bool {
+        if !self.addr_seen || self.confirmed() {
+            return false;
+        }
+        let Some(p) = self.pmtu.as_mut() else {
+            return false;
+        };
+        if p.unanswered_since
+            .is_none_or(|t| now.saturating_duration_since(t) < timeout)
+        {
+            return false;
+        }
+        p.unanswered_since = None;
+        self.addr_seen = false;
+        true
+    }
+
     /// Gossip or relay hints can't displace a confirmed or seen address,
     /// which stops forged `REQ_KEY`s redirecting traffic.
     pub(crate) fn on_addr_hint(&mut self, addr: SocketAddr) -> bool {
@@ -267,6 +288,23 @@ mod tests {
         assert_eq!(p.addr(), Some(addr("198.51.100.7:40000")));
         p.on_unreachable(Some(addr("198.51.100.7:40000")), now, Duration::ZERO);
         assert_eq!(p.addr(), None);
+    }
+
+    /// A dead seen address stops pinning once probes to it go unanswered
+    /// for a timeout window, so a hint may replace it.
+    #[test]
+    fn unanswered_seen_addr_is_released() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(30);
+        let mut p = UdpPath::default();
+        p.on_authenticated_rx(addr("192.0.2.1:655"), 0);
+        p.pmtu_mut(now).on_udp_probe_attempt(now, true);
+        assert!(!p.release_unanswered_seen(now + timeout / 2, timeout));
+        assert!(!p.on_addr_hint(addr("198.51.100.7:655")));
+        assert!(p.release_unanswered_seen(now + timeout, timeout));
+        assert!(!p.addr_seen());
+        assert!(p.on_addr_hint(addr("198.51.100.7:655")));
+        assert_eq!(p.addr(), Some(addr("198.51.100.7:655")));
     }
 
     #[test]
