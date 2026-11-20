@@ -29,3 +29,7 @@ android/**/build/
 android/app/src/main/jniLibs/
 android/.gradle/
 android/local.properties
+android-ondemand/**/build/
+android-ondemand/app/src/main/jniLibs/
+android-ondemand/.gradle/
+android-ondemand/local.properties
