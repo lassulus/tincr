@@ -76,6 +76,9 @@
           tincr-app = (androidPkgsFor system).callPackage ./nix/android-app.nix {
             inherit (self.packages.${system}) tincd-android;
           };
+          tincr-ondemand-app = (androidPkgsFor system).callPackage ./nix/android-ondemand-app.nix {
+            inherit (self.packages.${system}) tincd-android;
+          };
         }
       );
 
@@ -107,9 +110,17 @@
           clippy = tincd.clippy;
         }
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-          inherit (self.packages.${system}) tincd-android tincd-android-x86_64 tincr-app;
+          inherit (self.packages.${system})
+            tincd-android
+            tincd-android-x86_64
+            tincr-app
+            tincr-ondemand-app
+            ;
           android-mesh = (androidPkgsFor system).callPackage ./nix/android-mesh-check.nix {
             inherit (self.packages.${system}) tincr-app;
+          };
+          android-ondemand = (androidPkgsFor system).callPackage ./nix/android-ondemand-check.nix {
+            inherit (self.packages.${system}) tincr-ondemand-app;
           };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
