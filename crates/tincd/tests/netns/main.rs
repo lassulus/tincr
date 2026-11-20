@@ -15,6 +15,7 @@ mod bpf_steer;
 mod chaos;
 mod crossimpl;
 mod nat_hub;
+mod ondemand;
 mod ping;
 mod portmap;
 mod sandbox;
