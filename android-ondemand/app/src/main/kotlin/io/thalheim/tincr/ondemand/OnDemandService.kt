@@ -97,9 +97,9 @@ class OnDemandService : VpnService() {
         val settings = Settings(this)
         val dir = settings.dir
         if (!File(dir, "tinc.conf").isFile) return fail(startId, "No config imported")
-        val hub = settings.hub.ifBlank { TincConf.connectTo(dir).orEmpty() }
-        if (hub.isEmpty()) return fail(startId, "No hub set")
-        TincConf.enforce(dir, hub, settings.idleSeconds)
+        val peers = settings.peers.ifEmpty { TincConf.connectTo(dir) }
+        if (peers.isEmpty()) return fail(startId, "No peers to dial")
+        TincConf.enforce(dir, peers, settings.idleSeconds)
 
         val config = NetworkConfig.load(dir)
         val tun = establish(config) ?: return fail(startId, "VPN permission missing")

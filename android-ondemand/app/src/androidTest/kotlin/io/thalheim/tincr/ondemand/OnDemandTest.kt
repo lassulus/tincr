@@ -106,7 +106,7 @@ class OnDemandTest {
             writeText(readText().replace("DeviceType = dummy", "DeviceType = fd\nDevice = @tincr-ondemand-gate"))
         }
         ConfigImport.fromZip(ByteArrayInputStream(zipAssets("mesh/phone")), phoneDir)
-        settings.hub = "gate"
+        settings.peers = listOf("gate")
         settings.idleSeconds = 5
 
         val responder = IcmpEcho("tincr-ondemand-gate").also { echo = it }

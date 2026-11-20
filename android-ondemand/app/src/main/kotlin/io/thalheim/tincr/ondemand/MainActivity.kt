@@ -32,7 +32,7 @@ class MainActivity : Activity() {
     private val bg = Handler(worker.looper)
     private lateinit var status: TextView
     private lateinit var toggle: Switch
-    private lateinit var hub: EditText
+    private lateinit var peers: EditText
     private lateinit var idle: EditText
     private lateinit var message: TextView
 
@@ -59,8 +59,8 @@ class MainActivity : Activity() {
                 refresh()
             }
         }
-        hub = EditText(this).apply {
-            hint = "hub (ConnectTo)"
+        peers = EditText(this).apply {
+            hint = "ConnectTo names, e.g. homeserver neoprism"
             setSingleLine()
         }
         idle = EditText(this).apply {
@@ -75,8 +75,10 @@ class MainActivity : Activity() {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
-            listOf(status, toggle, label("Hub", pad), hub, label("Idle timeout (minutes)", pad), idle, importButton, message)
-                .forEach { addView(it) }
+            listOf(
+                status, toggle, label("Peers to dial (closest wins)", pad), peers,
+                label("Idle timeout (minutes)", pad), idle, importButton, message,
+            ).forEach { addView(it) }
         }
         // fitsSystemWindows replaces the padding of the view it is set on.
         setContentView(
@@ -85,7 +87,7 @@ class MainActivity : Activity() {
                 addView(column)
             }
         )
-        hub.setText(settings.hub)
+        peers.setText(settings.peers.joinToString(" "))
         idle.setText(((settings.idleSeconds + 59) / 60).toString())
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -129,7 +131,7 @@ class MainActivity : Activity() {
     }
 
     private fun save() {
-        settings.hub = hub.text.toString()
+        settings.peers = peers.text.toString().split(Regex("[\\s,]+")).filter { it.isNotEmpty() }
         idle.text.toString().toIntOrNull()?.takeIf { it > 0 }?.let { settings.idleSeconds = it * 60 }
     }
 
@@ -170,7 +172,7 @@ class MainActivity : Activity() {
                     }
                     runOnUiThread {
                         result.onSuccess { found ->
-                            if (found != null) hub.setText(found)
+                            if (found.isNotEmpty()) peers.setText(found.joinToString(" "))
                             save()
                             setNote("Config imported.")
                         }.onFailure { setNote("Import failed: ${it.message}") }

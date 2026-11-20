@@ -8,9 +8,10 @@ class Settings(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     val dir = File(context.filesDir, "networks/default")
 
-    var hub: String
-        get() = prefs.getString("hub", "").orEmpty()
-        set(v) = prefs.edit().putString("hub", v.trim()).apply()
+    // ConnectTo candidates; tincd keeps whichever answers first.
+    var peers: List<String>
+        get() = prefs.getString("peers", "").orEmpty().split(Regex("[\\s,]+")).filter { it.isNotEmpty() }
+        set(v) = prefs.edit().putString("peers", v.joinToString(" ")).apply()
 
     var idleSeconds: Int
         get() = prefs.getInt("idle_seconds", 300)
