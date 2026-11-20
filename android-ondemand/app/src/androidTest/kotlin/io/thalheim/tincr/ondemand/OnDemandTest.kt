@@ -29,6 +29,9 @@ class OnDemandTest {
     private val gateDir = File(ctx.filesDir, "gate")
     private var gate: Tincd? = null
     private var echo: IcmpEcho? = null
+    private val ctl = TincCtl(phoneDir)
+
+    private fun status() = Status.query(ctl)
 
     // stdout followed by stderr.
     private fun shell(cmd: String): String {
@@ -47,9 +50,9 @@ class OnDemandTest {
     private fun diag(): String {
         val logcat = shell("logcat -d -s tincd tincr-ondemand AndroidRuntime:E")
             .lines().takeLast(40).joinToString("\n")
-        return "status: ${Status.query(ctx)} error: ${OnDemandService.error}\n" +
-            "phone conns: ${TincCtl(phoneDir).connections()}\n" +
-            "gate conns: ${TincCtl(gateDir).connections()}\n== logcat ==\n$logcat"
+        return "status: ${status()} error: ${OnDemandService.error}\n" +
+            "phone conns: ${ctl.connections()}\n" +
+            "gate conns: ${TincCtl(gateDir).use { it.connections() }}\n== logcat ==\n$logcat"
     }
 
     private fun poll(timeoutMs: Long, what: String, cond: () -> Boolean) {
@@ -106,6 +109,10 @@ class OnDemandTest {
             writeText(readText().replace("DeviceType = dummy", "DeviceType = fd\nDevice = @tincr-ondemand-gate"))
         }
         ConfigImport.fromZip(ByteArrayInputStream(zipAssets("mesh/phone")), phoneDir)
+        // Like most real configs, no Port: the app must avoid tinc's default 655.
+        File(phoneDir, "tinc.conf").apply {
+            writeText(readLines().filterNot { it.startsWith("Port") }.joinToString("\n", postfix = "\n"))
+        }
         settings.peers = listOf("gate")
         settings.idleSeconds = 5
 
@@ -117,9 +124,11 @@ class OnDemandTest {
         shell("appops set ${ctx.packageName} ACTIVATE_VPN allow")
         poll(10_000, "VPN consent") { VpnService.prepare(ctx) == null }
         OnDemandService.start(ctx)
-        poll(20_000, "Sleeping after start") { Status.query(ctx) == Status.Sleeping }
+        poll(20_000, "Sleeping after start") { status() == Status.Sleeping }
         val conf = File(phoneDir, "tinc.conf").readText()
         assertTrue(conf, conf.contains("OnDemand = yes\nIdleTimeout = 5\n"))
+        // Android forbids binding tinc's default 655.
+        assertTrue(OnDemandService.notice.orEmpty(), OnDemandService.notice.orEmpty().contains("Port"))
 
         // Netd applies the VPN's uid routing after establish(); until then the
         // shell's packet leaves via wlan0. Inspecting the route sends nothing.
@@ -129,11 +138,11 @@ class OnDemandTest {
         // One packet must wake tincd and survive until the tunnel is up.
         val ping = shell("ping -c 1 -W 10 10.243.1.1")
         assertTrue("$ping\n${diag()}", ping.contains(" 1 received"))
-        poll(5_000, "Connected to gate") { Status.query(ctx) == Status.Connected("gate") }
-        poll(30_000, "Sleeping after idle timeout") { Status.query(ctx) == Status.Sleeping }
+        poll(5_000, "Connected to gate") { status() == Status.Connected("gate") }
+        poll(30_000, "Sleeping after idle timeout") { status() == Status.Sleeping }
 
         OnDemandService.stop(ctx)
-        poll(15_000, "Off") { Status.query(ctx) == Status.Off }
+        poll(15_000, "Off") { status() == Status.Off }
         assertEquals(emptyList<Int>(), Tincd.pids(phoneDir))
         poll(10_000, "VPN interface gone") { !tunUp() }
     }
@@ -144,6 +153,7 @@ class OnDemandTest {
             OnDemandService.stop(ctx)
             poll(15_000, "phone off in teardown") { !OnDemandService.running }
         }
+        ctl.close()
         gate?.stop()
         echo?.close()
         assertEquals("libtincd.so processes left", emptyList<Int>(), Tincd.pids())

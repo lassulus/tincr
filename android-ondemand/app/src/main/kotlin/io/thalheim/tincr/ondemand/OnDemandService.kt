@@ -41,7 +41,13 @@ class OnDemandService : VpnService() {
         var error: String? = null
             private set
 
+        // Something the app adjusted on start, for the UI.
+        @Volatile
+        var notice: String? = null
+            private set
+
         fun start(context: Context) {
+            Log.i(TAG, "switching on")
             context.startForegroundService(Intent(context, OnDemandService::class.java))
         }
 
@@ -62,7 +68,17 @@ class OnDemandService : VpnService() {
             turnOff(startId, null)
             return START_NOT_STICKY
         }
-        startForeground(1, notification())
+        Log.i(TAG, "start command")
+        // Refused e.g. while the VPN grant is not visible to the FGS check yet:
+        // report it instead of crashing the app with the switch stuck on Off.
+        try {
+            startForeground(1, notification())
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "startForeground refused", e)
+            error = "Could not start: ${e.message}"
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         running = true
         error = null
         worker.execute { startVpn(startId) }
@@ -83,12 +99,15 @@ class OnDemandService : VpnService() {
 
     private fun startVpn(startId: Int) {
         if (daemon != null) return
-        // A stop queued before this start removed the notification.
-        startForeground(1, notification())
         running = true
         try {
+            // A stop queued before this start removed the notification.
+            startForeground(1, notification())
             launch(startId)
         } catch (e: IOException) {
+            fail(startId, "start failed: ${e.message}")
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "start failed", e)
             fail(startId, "start failed: ${e.message}")
         }
     }
@@ -106,7 +125,16 @@ class OnDemandService : VpnService() {
         this.tun = tun
         val server = TunFdServer(TincConf.TUN_SOCKET, tun.fileDescriptor).also { fdServer = it }
         val runner = Tincd(this, dir).also { daemon = it }
-        runner.start { code ->
+        val port = TincConf.port(dir)
+        val options = if (TincConf.needsUnprivilegedPort(port)) {
+            notice = "Port ${port ?: "unset (655)"} is not allowed for apps; using a random port."
+            Log.i(TAG, notice!!)
+            listOf("Port=0")
+        } else {
+            notice = null
+            emptyList()
+        }
+        runner.start(options) { code ->
             worker.execute { if (daemon === runner) fail(null, "tincd exited ($code)") }
         }
         val served = server.serveOnce(30_000) { runner.alive }
@@ -135,7 +163,7 @@ class OnDemandService : VpnService() {
     private fun watchNetwork(dir: File) {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                thread(name = "tincr-retry") { TincCtl(dir).request(TincCtl.REQ_RETRY) }
+                thread(name = "tincr-retry") { TincCtl(dir).use { it.request(TincCtl.REQ_RETRY) } }
             }
         }
         getSystemService(ConnectivityManager::class.java).registerNetworkCallback(

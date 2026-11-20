@@ -3,13 +3,16 @@ package io.thalheim.tincr.ondemand
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import java.io.BufferedReader
+import java.io.Closeable
 import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 
-// Control-socket client: greeting `0 ^COOKIE 0` (two reply
-// lines), then `18 <req>` acked with `18 <req> <result>`.
-class TincCtl(private val dir: File) {
+// Control-socket client: greeting `0 ^COOKIE 0` (two reply lines), then
+// `18 <req>` acked with `18 <req> <result>`. One session serves many
+// requests, so a status poll costs tincd one read and one write instead
+// of an accept, a greeting and a close.
+class TincCtl(private val dir: File) : Closeable {
     companion object {
         const val REQ_STOP = 0
         const val REQ_DUMP_CONNECTIONS = 6
@@ -17,6 +20,9 @@ class TincCtl(private val dir: File) {
         private const val STATUS_ACTIVE = 1 shl 1
         private const val STATUS_CONTROL = 1 shl 9
     }
+
+    private var sock: LocalSocket? = null
+    private var reader: BufferedReader? = null
 
     private fun cookie(): String? =
         File(dir, "tincd.pid").takeIf { it.isFile }
@@ -35,33 +41,53 @@ class TincCtl(private val dir: File) {
         }
         ?.toMap()
 
-    // Lines up to and including the `18 <req> ...` terminator.
-    private fun converse(req: Int): List<String>? {
-        val cookie = cookie() ?: return null
-        return try {
-            LocalSocket().use { sock ->
-                sock.connect(
-                    LocalSocketAddress(
-                        File(dir, "tincd.socket").absolutePath,
-                        LocalSocketAddress.Namespace.FILESYSTEM,
-                    )
-                )
-                sock.soTimeout = 5_000
-                val r = BufferedReader(InputStreamReader(sock.inputStream))
-                sock.outputStream.write("0 ^$cookie 0\n".toByteArray())
-                r.readLine() ?: return null
-                r.readLine() ?: return null
-                sock.outputStream.write("18 $req\n".toByteArray())
-                val out = mutableListOf<String>()
-                while (true) {
-                    val line = r.readLine() ?: return null
-                    out.add(line)
-                    if (line.split(' ').size <= 3) break
-                }
-                out
-            }
+    @Synchronized
+    override fun close() {
+        try {
+            sock?.close()
         } catch (_: IOException) {
-            null
         }
+        sock = null
+        reader = null
+    }
+
+    @Synchronized
+    private fun open(): BufferedReader? {
+        reader?.let { return it }
+        val cookie = cookie() ?: return null
+        val s = LocalSocket()
+        s.connect(LocalSocketAddress(File(dir, "tincd.socket").absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+        s.soTimeout = 5_000
+        val r = BufferedReader(InputStreamReader(s.inputStream))
+        s.outputStream.write("0 ^$cookie 0\n".toByteArray())
+        if (r.readLine() == null || r.readLine() == null) {
+            s.close()
+            return null
+        }
+        sock = s
+        reader = r
+        return r
+    }
+
+    // Lines up to and including the `18 <req> ...` terminator. A broken
+    // session (daemon restarted) is dropped; the next call reconnects.
+    @Synchronized
+    private fun converse(req: Int): List<String>? = try {
+        val r = open()
+        if (r == null) {
+            null
+        } else {
+            sock!!.outputStream.write("18 $req\n".toByteArray())
+            val out = mutableListOf<String>()
+            while (true) {
+                val line = r.readLine() ?: throw IOException("eof")
+                out.add(line)
+                if (line.split(' ').size <= 3) break
+            }
+            out
+        }
+    } catch (_: IOException) {
+        close()
+        null
     }
 }

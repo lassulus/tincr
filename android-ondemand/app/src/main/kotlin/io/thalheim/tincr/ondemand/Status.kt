@@ -1,7 +1,5 @@
 package io.thalheim.tincr.ondemand
 
-import android.content.Context
-
 sealed class Status(val label: String) {
     data object Off : Status("Off")
     data object Starting : Status("Starting…")
@@ -11,12 +9,12 @@ sealed class Status(val label: String) {
     data class Connected(val peer: String) : Status("Connected to $peer")
 
     companion object {
-        // One control-socket round trip, which wakes tincd: call only
+        // One request on `ctl`'s session, which wakes tincd: call only
         // while someone is looking.
-        fun query(context: Context): Status {
+        fun query(ctl: TincCtl): Status {
             if (!OnDemandService.running) return Off
             if (OnDemandService.stopping) return Stopping
-            val conns = TincCtl(Settings(context).dir).connections() ?: return Starting
+            val conns = ctl.connections() ?: return Starting
             conns.entries.firstOrNull { it.value }?.let { return Connected(it.key) }
             return if (conns.isEmpty()) Sleeping else Connecting
         }

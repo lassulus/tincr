@@ -17,14 +17,19 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import android.util.Log
 import java.io.File
 
 // Plain framework views; status is polled only while resumed.
 class MainActivity : Activity() {
     companion object {
+        private const val TAG = "tincr-ondemand"
         private const val REQ_VPN = 1
         private const val REQ_IMPORT = 2
-        private const val POLL_MS = 2_000L
+
+        // Each poll wakes tincd: fast only while a state change is due.
+        private const val POLL_FAST_MS = 1_000L
+        private const val POLL_STEADY_MS = 15_000L
     }
 
     private val settings by lazy { Settings(this) }
@@ -39,12 +44,19 @@ class MainActivity : Activity() {
     // Outcome of the last import; wins over the status-derived hint.
     private var note: String? = null
 
+    // The VPN consent dialog is up or just answered; resolved in onResume.
+    private var consentPending = false
+
+    // One control session while visible, closed in onPause.
+    private val ctl by lazy { TincCtl(settings.dir) }
+
     private val poll = object : Runnable {
         override fun run() {
-            val s = Status.query(this@MainActivity)
+            val s = Status.query(ctl)
             val hasConfig = File(settings.dir, "tinc.conf").isFile
             runOnUiThread { show(s, hasConfig) }
-            bg.postDelayed(this, POLL_MS)
+            val steady = s == Status.Off || s == Status.Sleeping || s is Status.Connected
+            bg.postDelayed(this, if (steady) POLL_STEADY_MS else POLL_FAST_MS)
         }
     }
 
@@ -103,11 +115,13 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        bg.post(poll)
+        // Both paths schedule exactly one poll chain.
+        if (consentPending) consentAnswered() else bg.post(poll)
     }
 
     override fun onPause() {
         bg.removeCallbacks(poll)
+        bg.post { ctl.close() }
         save()
         super.onPause()
     }
@@ -118,9 +132,10 @@ class MainActivity : Activity() {
     }
 
     private fun show(s: Status, hasConfig: Boolean) {
-        status.text = s.label
-        toggle.isChecked = s != Status.Off && s != Status.Stopping
-        message.text = note ?: OnDemandService.error ?: if (hasConfig) "" else "No config imported yet."
+        status.text = if (consentPending) "Waiting for VPN permission…" else s.label
+        toggle.isChecked = consentPending || (s != Status.Off && s != Status.Stopping)
+        message.text = note ?: OnDemandService.error ?: OnDemandService.notice
+            ?: if (hasConfig) "" else "No config imported yet."
     }
 
     // The service applies start/stop asynchronously; look again shortly.
@@ -138,10 +153,36 @@ class MainActivity : Activity() {
     private fun switchOn() {
         save()
         val consent = VpnService.prepare(this)
-        if (consent != null) startActivityForResult(consent, REQ_VPN) else start()
+        if (consent == null) return start()
+        Log.i(TAG, "asking for VPN consent")
+        consentPending = true
+        startActivityForResult(consent, REQ_VPN)
     }
 
-    private fun start() = OnDemandService.start(this)
+    // Decided by the grant itself, not the result code, and only once
+    // resumed: onActivityResult runs before onResume, while the app may
+    // still count as background for starting a foreground service.
+    private fun consentAnswered() {
+        consentPending = false
+        refresh()
+        if (VpnService.prepare(this) == null) {
+            Log.i(TAG, "VPN consent granted")
+            start()
+        } else {
+            Log.i(TAG, "VPN consent not granted")
+            toggle.isChecked = false
+            setNote("VPN permission not granted.")
+        }
+    }
+
+    private fun start() {
+        try {
+            OnDemandService.start(this)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "start refused", e)
+            setNote("Could not start: ${e.message}")
+        }
+    }
 
     private fun pickZip() {
         if (OnDemandService.running) {
@@ -162,7 +203,8 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
-            REQ_VPN -> if (resultCode == RESULT_OK) start() else toggle.isChecked = false
+            // Handled in onResume, which follows right after.
+            REQ_VPN -> Log.i(TAG, "VPN consent dialog closed ($resultCode)")
             REQ_IMPORT -> data?.data?.takeIf { resultCode == RESULT_OK }?.let { uri ->
                 setNote("Importing…")
                 bg.post {

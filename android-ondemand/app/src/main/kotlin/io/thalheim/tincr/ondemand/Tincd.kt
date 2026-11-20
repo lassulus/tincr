@@ -16,14 +16,17 @@ class Tincd(context: Context, private val dir: File) {
     val alive: Boolean
         get() = process?.isAlive == true
 
+    // `options` become `-o KEY=VALUE` (they beat the config files).
     // onExit runs on the log thread once tincd is gone, whoever stopped it.
-    fun start(onExit: (Int) -> Unit) {
+    fun start(options: List<String> = emptyList(), onExit: (Int) -> Unit) {
         reap(dir)
         val pb = ProcessBuilder(
-            binary.absolutePath,
-            "-D",
-            "--config", dir.absolutePath,
-            "--pidfile", File(dir, "tincd.pid").absolutePath,
+            listOf(
+                binary.absolutePath,
+                "-D",
+                "--config", dir.absolutePath,
+                "--pidfile", File(dir, "tincd.pid").absolutePath,
+            ) + options.flatMap { listOf("-o", it) },
         ).redirectErrorStream(true)
         pb.environment()["RUST_LOG"] = "warn"
         val p = pb.start()
@@ -35,7 +38,7 @@ class Tincd(context: Context, private val dir: File) {
     }
 
     fun stop() {
-        TincCtl(dir).request(TincCtl.REQ_STOP)
+        TincCtl(dir).use { it.request(TincCtl.REQ_STOP) }
         process?.waitFor(3, TimeUnit.SECONDS)
         reap(dir)
         // Collect the zombie; reap() has already signalled it.
@@ -64,7 +67,7 @@ class Tincd(context: Context, private val dir: File) {
                 ?.readText()?.trim()?.split(Regex("\\s+"))?.firstOrNull()?.toIntOrNull()
             val left = { (pids(dir) + listOfNotNull(pidFile?.takeIf { it in pids() })).distinct() }
             if (left().isEmpty()) return
-            TincCtl(dir).request(TincCtl.REQ_STOP)
+            TincCtl(dir).use { it.request(TincCtl.REQ_STOP) }
             for (signal in listOf(SIGTERM, SIGKILL)) {
                 if (waitGone(left, 3_000)) return
                 left().forEach {
