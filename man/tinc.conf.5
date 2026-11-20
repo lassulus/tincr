@@ -239,6 +239,13 @@ Dial
 peers only when the device has a unicast packet for the VPN, and hold
 packets that have no route or tunnel key yet (up to 10 seconds) instead
 of answering them with ICMP unreachable.
+On waking all
+.Va ConnectTo
+peers are dialled at once; the first to complete the handshake (the
+closest, e.g. one on the local network) is kept and the others are
+dropped, so there is a single meta connection.
+Data still goes directly over UDP to its destination wherever possible.
+If that connection fails, all peers are raced again.
 After
 .Va IdleTimeout
 seconds without data traffic all meta connections are closed and no

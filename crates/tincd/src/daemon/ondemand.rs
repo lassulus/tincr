@@ -1,8 +1,8 @@
 //! `OnDemand = yes`: no meta connections and no armed timers until the device
-//! has a packet for the VPN. That packet wakes the `ConnectTo` slots; packets
-//! that cannot be delivered yet (no route, no tunnel key) are held and replayed.
-//! After `IdleTimeout` seconds without data traffic everything is closed again
-//! and `epoll_wait` blocks without a timeout.
+//! has a packet for the VPN. That packet races all `ConnectTo` candidates and
+//! keeps the first to ACK (the closest); data then goes direct over UDP as usual.
+//! Packets without a route or key yet are held and replayed. After `IdleTimeout`
+//! seconds without data traffic everything is closed and `epoll_wait` blocks.
 
 #![forbid(unsafe_code)]
 
@@ -15,10 +15,11 @@ use super::{ConnId, Daemon, TimerWhat};
 use crate::clock;
 use crate::event::{TimerHandle, Timers};
 use crate::graph::NodeId;
-use crate::outgoing::OutState;
+use crate::outgoing::{OutOrigin, OutState, Outgoing, OutgoingId};
 use crate::packet::{ETH_P_IP, ETH_P_IPV6, ethertype};
 use crate::route_decide::RouteResult;
 use crate::tunnel::TunnelState;
+use slotmap::SlotMap;
 
 /// How long a packet waits for its route and tunnel key. Covers a meta
 /// handshake plus `REQ_KEY` over a slow mobile link; past it the packet
@@ -128,7 +129,19 @@ impl Daemon {
             &self.keyexpire_timer,
             Duration::from_secs(u64::from(self.settings.keylifetime)),
         );
-        let oids: Vec<_> = self.outgoings.keys().collect();
+        self.ondemand_race();
+    }
+
+    /// Dial every idle `ConnectTo` slot at once. The first to reach
+    /// ACK is the closest by handshake RTT (a LAN peer beats a far
+    /// hub) and `ondemand_race_won` cancels the rest.
+    fn ondemand_race(&mut self) {
+        let oids: Vec<_> = self
+            .outgoings
+            .iter()
+            .filter(|(_, o)| o.origin == OutOrigin::ConfigConnectTo)
+            .map(|(oid, _)| oid)
+            .collect();
         for oid in oids {
             if let Some(o) = self.outgoings.get_mut(oid) {
                 o.timeout = 0;
@@ -137,13 +150,76 @@ impl Daemon {
         }
     }
 
+    /// `id` (a `ConnectTo` conn) just reached ACK: drop the other
+    /// candidates, dialling or connected, and park their slots. One
+    /// meta connection is enough; data goes direct over UDP.
+    pub(super) fn ondemand_race_won(&mut self, id: ConnId) {
+        if self.ondemand.as_ref().is_none_or(|od| od.asleep) {
+            return;
+        }
+        let is_connect_to = |o: Option<OutgoingId>, outgoings: &SlotMap<OutgoingId, Outgoing>| {
+            o.and_then(|oid| outgoings.get(oid))
+                .is_some_and(|o| o.origin == OutOrigin::ConfigConnectTo)
+        };
+        if !self
+            .conns
+            .get(id)
+            .is_some_and(|c| is_connect_to(c.outgoing, &self.outgoings))
+        {
+            return;
+        }
+        let losers: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|&(cid, c)| cid != id && is_connect_to(c.outgoing, &self.outgoings))
+            .map(|(cid, _)| cid)
+            .collect();
+        for o in self.outgoings.values_mut() {
+            if o.origin == OutOrigin::ConfigConnectTo && o.state.conn() != Some(id) {
+                o.state = OutState::Idle;
+            }
+        }
+        for cid in losers {
+            // Cleared so `terminate` does not redial the slot.
+            if let Some(c) = self.conns.get_mut(cid) {
+                c.outgoing = None;
+            }
+            self.terminate(cid);
+        }
+        if let Some(c) = self.conns.get(id) {
+            log::info!(target: "tincd", "Using {} for meta traffic", c.name);
+        }
+    }
+
+    /// The last `ConnectTo` conn died while awake: race all candidates
+    /// again instead of retrying only the one that failed.
+    pub(super) fn ondemand_conn_lost(&mut self) {
+        if self.ondemand.as_ref().is_none_or(|od| od.asleep) {
+            return;
+        }
+        // Only an ACKed conn counts: `terminate` may have redialled
+        // the failed slot, which must not stop the race.
+        let any_left = self.conns.values().any(|c| {
+            c.active
+                && c.outgoing
+                    .and_then(|oid| self.outgoings.get(oid))
+                    .is_some_and(|o| o.origin == OutOrigin::ConfigConnectTo)
+        });
+        if !any_left {
+            self.ondemand_race();
+        }
+    }
+
     /// Close every peer connection, park the outgoing slots and disarm
     /// all timers. Control connections stay.
     fn ondemand_sleep(&mut self) {
         log::info!(target: "tincd",
                    "No traffic for {} seconds, going to sleep", self.settings.idle_timeout);
-        // Idle the slots first so `terminate` does not redial.
-        // Dropping a `Backoff` handle cancels its retry timer.
+        // Asleep first: `terminate` must not re-race. Idle slots do
+        // not redial; dropping a `Backoff` handle cancels its timer.
+        if let Some(od) = self.ondemand.as_mut() {
+            od.asleep = true;
+        }
         for o in self.outgoings.values_mut() {
             o.state = OutState::Idle;
         }
@@ -158,7 +234,6 @@ impl Daemon {
         }
         self.ondemand_disarm_timers();
         if let Some(od) = self.ondemand.as_mut() {
-            od.asleep = true;
             od.held.clear();
             self.timers.del(&od.idle_timer);
             self.timers.del(&od.hold_timer);

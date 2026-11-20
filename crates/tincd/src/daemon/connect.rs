@@ -246,6 +246,9 @@ impl Daemon {
         // First time peer becomes reachable.
         self.run_graph_and_log();
 
+        if self.ondemand.is_some() {
+            self.ondemand_race_won(id);
+        }
         Ok(nw)
     }
 
@@ -413,6 +416,9 @@ impl Daemon {
                 o.timeout = 0;
             }
             self.do_outgoing_connection(oid);
+        }
+        if was_active && conn_outgoing.is_some() && self.ondemand.is_some() {
+            self.ondemand_conn_lost();
         }
     }
 
