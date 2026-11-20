@@ -27,6 +27,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions.jvmTarget = "17"
+
+    // The main app's two-node test mesh (keys, hosts, configs).
+    sourceSets["androidTest"].assets.srcDir("../../android/app/src/androidTest/assets")
 }
 
 // Plain framework Views: no runtime dependencies besides the Kotlin stdlib.
