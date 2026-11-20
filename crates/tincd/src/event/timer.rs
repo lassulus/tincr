@@ -138,6 +138,18 @@ impl<W: Copy> Timers<W> {
         debug_assert!(prev.is_none(), "seq tiebreak collided — impossible");
     }
 
+    /// Disarm without freeing the slot; `set` re-arms it.
+    pub(crate) fn del(&mut self, h: &TimerHandle) {
+        if let Some(key) = self
+            .slots
+            .get_mut(h.idx)
+            .and_then(Option::as_mut)
+            .and_then(|slot| slot.at.take())
+        {
+            self.by_deadline.remove(&key);
+        }
+    }
+
     /// Free the slots of dropped handles.
     fn reap(&mut self) {
         let dropped = self.dropped.take();
@@ -386,6 +398,23 @@ mod tests {
         // But not freed — re-arm works without re-adding.
         t.set(&ping, Duration::from_secs(1));
         assert!(!t.is_idle());
+    }
+
+    /// `del` leaves nothing armed (poll may block forever) but keeps
+    /// the handle usable.
+    #[test]
+    fn del_disarms_keeps_slot() {
+        let mut t = Timers::new();
+        let ping = t.add_after(What::Ping, Duration::from_secs(1));
+        t.del(&ping);
+        assert!(t.is_idle());
+        assert_eq!(t.next_timeout(), None);
+        t.del(&ping);
+        t.set(&ping, Duration::from_millis(1));
+        sleep(Duration::from_millis(5));
+        let mut out = Vec::new();
+        t.tick(&mut out);
+        assert_eq!(out, vec![What::Ping]);
     }
 
     /// Multiple timers, mixed expiry. Drains all <= now in one tick.
