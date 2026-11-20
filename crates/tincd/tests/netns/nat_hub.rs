@@ -13,13 +13,12 @@
 //! listener. `observer` learns both via gossip and must not dial the
 //! latter for leaf.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use super::common::linux::{run_ip, run_ip_in};
-use super::common::{TmpGuard, tincd_bin, try_poll};
-use super::rig::{ChildNetNs, Node, enter_bwrap, veth_pair};
-use std::fmt::Write as _;
+use super::common::{TmpGuard, try_poll};
+use super::rig::{ChildNetNs, Node, enter_bwrap, set_address, start_in, veth_pair};
 use std::fs;
 use std::path::Path;
 
@@ -61,36 +60,6 @@ fn load_nft(ns: &str, test_name: &str, path: &Path, rules: &str) -> bool {
         );
     }
     out.status.success()
-}
-
-/// Start `node` inside `ns` (or the outer netns for `None`).
-fn start_in(node: &mut Node, ns: Option<&str>) {
-    let mut cmd = match ns {
-        Some(ns) => {
-            let mut cmd = Command::new("ip");
-            cmd.args(["netns", "exec", ns]).arg(tincd_bin());
-            cmd
-        }
-        None => Command::new(tincd_bin()),
-    };
-    cmd.arg("-D")
-        .arg("-c")
-        .arg(&node.confbase)
-        .arg("--pidfile")
-        .arg(&node.pidfile)
-        .arg("--socket")
-        .arg(&node.socket)
-        .env("RUST_LOG", &node.rust_log)
-        .stderr(Stdio::piped());
-    node.start_command(cmd);
-}
-
-/// `Address = ip port` in `self_node`'s copy of `peer`'s host file.
-fn set_address(self_node: &Node, peer: &Node, ip: &str, port: u16) {
-    let path = self_node.confbase.join("hosts").join(&peer.name);
-    let mut host = fs::read_to_string(&path).unwrap();
-    writeln!(host, "Address = {ip} {port}").unwrap();
-    fs::write(path, host).unwrap();
 }
 
 struct Mesh {

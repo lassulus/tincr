@@ -6,8 +6,10 @@ use super::common::linux::{
     bwrap_inner_init, bwrap_reexec, bwrap_usable, run_ip, run_ip_in, wait_for_carrier,
 };
 pub(crate) use super::common::node::Node;
-use super::common::{TmpGuard, node_status, poll_until, try_poll};
+use super::common::{TmpGuard, node_status, poll_until, tincd_bin, try_poll};
 use std::env;
+use std::fmt::Write as _;
+use std::fs;
 use std::path::Path;
 
 /// Run `iptables ARGS`. Returns `false` (after a `SKIP:` line) if it fails,
@@ -215,6 +217,36 @@ pub(crate) fn tun_node(dir: &Path, name: &str, seed: u8, iface: &str) -> Node {
         // The one debug line worth having everywhere is net's
         // "Failed to decode UDP packet … BadSeqno".
         .log_level("tincd=info,tincd::net=debug")
+}
+
+/// Start `node` inside `ns` (or the outer netns for `None`).
+pub(crate) fn start_in(node: &mut Node, ns: Option<&str>) {
+    let mut cmd = match ns {
+        Some(ns) => {
+            let mut cmd = Command::new("ip");
+            cmd.args(["netns", "exec", ns]).arg(tincd_bin());
+            cmd
+        }
+        None => Command::new(tincd_bin()),
+    };
+    cmd.arg("-D")
+        .arg("-c")
+        .arg(&node.confbase)
+        .arg("--pidfile")
+        .arg(&node.pidfile)
+        .arg("--socket")
+        .arg(&node.socket)
+        .env("RUST_LOG", &node.rust_log)
+        .stderr(Stdio::piped());
+    node.start_command(cmd);
+}
+
+/// `Address = ip port` in `self_node`'s copy of `peer`'s host file.
+pub(crate) fn set_address(self_node: &Node, peer: &Node, ip: &str, port: u16) {
+    let path = self_node.confbase.join("hosts").join(&peer.name);
+    let mut host = fs::read_to_string(&path).unwrap();
+    writeln!(host, "Address = {ip} {port}").unwrap();
+    fs::write(path, host).unwrap();
 }
 
 /// alice (tinc0, 10.42.0.1) dials bob (tinc1 in `bobside`,

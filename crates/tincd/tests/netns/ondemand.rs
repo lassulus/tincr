@@ -7,8 +7,14 @@ use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::common::{TmpGuard, try_poll};
-use super::rig::{NetNs, Node, TunPair, enter_netns, ping, tun_node};
+use std::process::Command;
+
+use super::common::linux::{run_ip, run_ip_in};
+use super::common::{TmpGuard, node_status, try_poll};
+use super::rig::{
+    ChildNetNs, NetNs, Netem, Node, TunPair, enter_netns, ping, ping_once, set_address, start_in,
+    tun_node,
+};
 
 /// Both daemons listen on 127.0.0.1, so every meta or UDP packet
 /// between them crosses `lo`. `/proc/net/dev` is per netns; the
@@ -181,4 +187,177 @@ fn ondemand_idle_cost() {
     first_ping_ok(&alice, &pair.bob);
     alice.stop();
     pair.bob.stop();
+}
+
+/// alice's end of the "far" link (another netns behind netem delay).
+const FAR_OUTER: &str = "10.78.0.1";
+const FAR_HUB: &str = "10.78.0.2";
+const FAR_PORT: u16 = 6551;
+
+/// alice and bob on the "LAN" (both listen on 127.0.0.1, ~0 RTT), and
+/// `hub` in netns `far` behind 50 ms of netem each way. bob is
+/// connected to hub; alice is asleep with `ConnectTo = hub` and, with
+/// `near`, `ConnectTo = bob`.
+struct NearFar {
+    _far: ChildNetNs,
+    _delay: Netem,
+    pair: TunPair,
+    hub: Node,
+}
+
+impl NearFar {
+    fn start(netns: NetNs, tmp: &TmpGuard, near: bool) -> Self {
+        let far = ChildNetNs::new("far");
+        run_ip(&[
+            "link", "add", "veth-o", "type", "veth", "peer", "name", "veth-f",
+        ]);
+        run_ip(&["link", "set", "veth-f", "netns", "far"]);
+        run_ip(&["addr", "add", &format!("{FAR_OUTER}/24"), "dev", "veth-o"]);
+        run_ip(&["link", "set", "veth-o", "up"]);
+        run_ip_in(
+            "far",
+            &["addr", "add", &format!("{FAR_HUB}/24"), "dev", "veth-f"],
+        );
+        run_ip_in("far", &["link", "set", "veth-f", "up"]);
+        let delay = Netem::apply("veth-o", "delay 50ms");
+        let out = Command::new("ip")
+            .args([
+                "netns", "exec", "far", "tc", "qdisc", "add", "dev", "veth-f",
+            ])
+            .args(["root", "netem", "delay", "50ms"])
+            .output()
+            .expect("spawn tc");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // PingTimeout 5: the rig's 1 s would time out the far handshake.
+        let quiet = "AutoConnect = no\nPingTimeout = 5\n";
+        let mut pair = TunPair::new(netns, tmp, quiet);
+        pair.alice = pair
+            .alice
+            .with_conf("OnDemand = yes\nIdleTimeout = 30\nConnectTo = hub\n");
+        let mut hub = Node::new(tmp.path(), "hub", 0xCD).with_conf(quiet);
+        hub.port = FAR_PORT;
+        hub.write_config_multi(&[&pair.alice, &pair.bob], &[]);
+        start_in(&mut hub, Some("far"));
+
+        pair.bob.write_config_multi(&[&pair.alice, &hub], &[]);
+        set_address(&pair.bob, &hub, FAR_HUB, FAR_PORT);
+        let conf = pair.bob.confbase.join("tinc.conf");
+        let text = fs::read_to_string(&conf).unwrap() + "ConnectTo = hub\n";
+        fs::write(conf, text).unwrap();
+        pair.bob.start();
+        pair.bob.wait_for_peer("hub", true, Duration::from_secs(10));
+
+        // Without `near`, alice only learns bob's address via hub.
+        let dial: &[&Node] = if near { &[&pair.bob] } else { &[] };
+        pair.alice.write_config_multi(&[&pair.bob, &hub], dial);
+        set_address(&pair.alice, &hub, FAR_HUB, FAR_PORT);
+        pair.alice.start();
+        pair.netns.place_devices();
+        Self {
+            _far: far,
+            _delay: delay,
+            pair,
+            hub,
+        }
+    }
+
+    fn logs(&self) -> String {
+        format!(
+            "=== alice ===\n{}\n=== bob ===\n{}\n=== hub ===\n{}",
+            self.pair.alice.log(),
+            self.pair.bob.log(),
+            self.hub.log()
+        )
+    }
+
+    fn finish(mut self) {
+        self.hub.stop();
+        self.pair.finish();
+    }
+}
+
+/// Names of alice's peer connections.
+fn conn_names(node: &Node) -> Vec<String> {
+    node.ctl()
+        .dump(6)
+        .iter()
+        .filter_map(|row| row.strip_prefix("18 6 ")?.split_whitespace().next())
+        .filter(|name| *name != "<control>")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Largest RTT of `count` pings to bob, in ms.
+fn max_rtt(count: &str) -> f64 {
+    let out = ping(&["-c", count, "-i", "0.2", "-W", "2"], "10.42.0.2");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    stdout
+        .lines()
+        .find_map(|l| l.split(" = ").nth(1)?.split('/').nth(2)?.parse().ok())
+        .unwrap_or_else(|| panic!("no rtt line in:\n{stdout}"))
+}
+
+/// With a near and a far `ConnectTo`, the wake races both and keeps
+/// only the near one; the far hub is not used for meta or data.
+#[test]
+fn ondemand_wake_prefers_near_peer() {
+    let Some(netns) = enter_netns("ondemand::ondemand_wake_prefers_near_peer") else {
+        return;
+    };
+    let tmp = tmp!("ondemand-near");
+    let mesh = NearFar::start(netns, &tmp, true);
+    thread::sleep(Duration::from_millis(500));
+    assert!(conn_names(&mesh.pair.alice).is_empty(), "{}", mesh.logs());
+
+    first_ping_ok(&mesh.pair.alice, &mesh.pair.bob);
+    // Long enough for the far handshake to have finished had it run.
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(conn_names(&mesh.pair.alice), ["bob"], "{}", mesh.logs());
+    let rtt = max_rtt("5");
+    assert!(
+        rtt < 50.0,
+        "max rtt {rtt} ms: detour via hub?\n{}",
+        mesh.logs()
+    );
+    assert!(
+        mesh.pair.alice.log().contains("Using bob for meta traffic"),
+        "{}",
+        mesh.logs()
+    );
+    mesh.finish();
+}
+
+/// Only the far hub is a `ConnectTo`: meta goes there, but data to bob
+/// (on the LAN) switches to direct UDP instead of riding the hub.
+#[test]
+fn ondemand_data_goes_direct() {
+    let Some(netns) = enter_netns("ondemand::ondemand_data_goes_direct") else {
+        return;
+    };
+    let tmp = tmp!("ondemand-direct");
+    let mesh = NearFar::start(netns, &tmp, false);
+    first_ping_ok(&mesh.pair.alice, &mesh.pair.bob);
+    assert_eq!(conn_names(&mesh.pair.alice), ["hub"], "{}", mesh.logs());
+    // UDP confirmed (status bit 0x80) to bob within a few pings.
+    let udp = try_poll(Duration::from_secs(10), || {
+        ping_once("10.42.0.2");
+        node_status(&mesh.pair.alice.ctl().dump(3), "bob")
+            .is_some_and(|s| s & 0x80 != 0)
+            .then_some(())
+    });
+    assert!(udp.is_some(), "no direct UDP to bob\n{}", mesh.logs());
+    // Via hub every echo takes >= 2 x 100 ms.
+    let rtt = max_rtt("5");
+    assert!(
+        rtt < 50.0,
+        "max rtt {rtt} ms: detour via hub?\n{}",
+        mesh.logs()
+    );
+    mesh.finish();
 }
