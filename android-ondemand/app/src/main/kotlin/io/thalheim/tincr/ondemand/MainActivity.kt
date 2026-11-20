@@ -60,7 +60,7 @@ class MainActivity : Activity() {
             }
         }
         peers = EditText(this).apply {
-            hint = "ConnectTo names, e.g. homeserver neoprism"
+            hint = "ConnectTo node names, space-separated"
             setSingleLine()
         }
         idle = EditText(this).apply {
