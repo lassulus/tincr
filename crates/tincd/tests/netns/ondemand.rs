@@ -7,10 +7,10 @@ use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::common::linux::{run_ip, run_ip_in};
-use super::common::{TmpGuard, node_status, try_poll};
+use super::common::{KillOnDrop, TmpGuard, node_status, try_poll};
 use super::rig::{
     ChildNetNs, NetNs, Netem, Node, TunPair, enter_netns, ping, ping_once, set_address, start_in,
     tun_node,
@@ -125,6 +125,48 @@ fn ondemand_traffic_keeps_awake() {
     assert!(pair.alice.has_active_peer("bob"), "{}", pair.alice.log());
     let (alice_log, _) = pair.finish();
     assert!(!alice_log.contains("going to sleep"), "{alice_log}");
+}
+
+/// bob keeps pinging alice and sending UDP to a closed port. alice only
+/// answers (echo replies, port unreachable), so she still goes to sleep.
+#[test]
+fn ondemand_unsolicited_inbound_does_not_keep_awake() {
+    let Some(netns) = enter_netns("ondemand::ondemand_unsolicited_inbound_does_not_keep_awake")
+    else {
+        return;
+    };
+    let tmp = tmp!("ondemand-inbound");
+    let pair = ondemand_pair(netns, &tmp);
+    first_ping_ok(&pair.alice, &pair.bob);
+    let (in_before, _) = TunPair::traffic(&pair.alice);
+
+    let script = "while :; do ping -c 1 -W 1 10.42.0.1 >/dev/null; \
+                  echo x > /dev/udp/10.42.0.1/9; sleep 0.3; done";
+    let _noise = KillOnDrop(
+        Command::new("ip")
+            .args(["netns", "exec", "bobside", "bash", "-c", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn noise"),
+    );
+    thread::sleep(Duration::from_secs(1));
+    let (in_noise, _) = TunPair::traffic(&pair.alice);
+    assert!(
+        in_noise >= in_before + 3,
+        "noise not delivered: {in_before} -> {in_noise}"
+    );
+    // IdleTimeout = 3, checked every second.
+    let slept = try_poll(Duration::from_secs(8), || {
+        (peer_conns(&pair.alice) == 0).then_some(())
+    });
+    assert!(
+        slept.is_some(),
+        "inbound noise kept alice awake\n{}",
+        pair.alice.log()
+    );
+    let (alice_log, _) = pair.finish();
+    assert!(alice_log.contains("going to sleep"), "{alice_log}");
 }
 
 /// Context switches of every thread of `pid`.

@@ -2,7 +2,8 @@
 //! has a packet for the VPN. That packet races all `ConnectTo` candidates and
 //! keeps the first to ACK (the closest); data then goes direct over UDP as usual.
 //! Packets without a route or key yet are held and replayed. After `IdleTimeout`
-//! seconds without data traffic everything is closed and `epoll_wait` blocks.
+//! seconds in which the device initiated nothing, everything is closed and
+//! `epoll_wait` blocks.
 
 #![forbid(unsafe_code)]
 
@@ -39,8 +40,9 @@ pub(crate) struct OnDemand {
     pub(crate) asleep: bool,
     idle_timer: TimerHandle,
     hold_timer: TimerHandle,
-    /// Data packet count at the last idle check, and when it last moved.
-    seen_packets: u64,
+    /// Set by a device packet that [`initiates`] traffic, cleared by
+    /// the idle check; `last_active` is when it was last seen set.
+    local_activity: bool,
     last_active: Instant,
     /// Start of the window in which unroutable packets are held.
     woke_at: Instant,
@@ -54,7 +56,7 @@ impl OnDemand {
             asleep: true,
             idle_timer: timers.add(TimerWhat::OnDemandIdle),
             hold_timer: timers.add(TimerWhat::OnDemandHold),
-            seen_packets: 0,
+            local_activity: false,
             last_active: now,
             woke_at: now,
             held: VecDeque::new(),
@@ -63,6 +65,11 @@ impl OnDemand {
 
     pub(crate) fn has_held(&self) -> bool {
         !self.held.is_empty()
+    }
+
+    /// The device sent traffic of its own (TSO path, already known TCP data).
+    pub(crate) fn note_local(&mut self) {
+        self.local_activity = true;
     }
 }
 
@@ -80,6 +87,31 @@ fn wakes(data: &[u8]) -> bool {
     }
 }
 
+/// Whether a unicast device packet is traffic the host initiated, as
+/// opposed to its stack answering something unsolicited from the mesh
+/// (echo reply, ICMP error, TCP RST or SYN-ACK). Only these keep an
+/// `OnDemand` daemon awake, so scanners cannot.
+fn initiates(data: &[u8]) -> bool {
+    let (proto, l4) = match ethertype(data) {
+        Some(ETH_P_IP) => {
+            let ihl = data.get(14).map_or(20, |b| usize::from(b & 0x0f) * 4);
+            (data.get(23).copied(), 14 + ihl)
+        }
+        Some(ETH_P_IPV6) => (data.get(20).copied(), 54),
+        _ => return false,
+    };
+    let byte = |off: usize| data.get(l4 + off).copied();
+    match proto {
+        // Echo reply, unreachable, time exceeded, parameter problem.
+        Some(1) => !matches!(byte(0), Some(0 | 3 | 11 | 12)),
+        // ICMPv6 errors 1..=4 and echo reply.
+        Some(58) => !matches!(byte(0), Some(1..=4 | 129)),
+        // RST, or SYN+ACK.
+        Some(6) => !byte(13).is_some_and(|f| f & 0x04 != 0 || f & 0x12 == 0x12),
+        _ => true,
+    }
+}
+
 impl Daemon {
     /// Disarm the timers that would wake an idle daemon.
     pub(super) fn ondemand_disarm_timers(&mut self) {
@@ -89,21 +121,9 @@ impl Daemon {
         self.timers.del(&self.keyexpire_timer);
     }
 
-    /// Data packets moved to or from peers, both directions. Shard
-    /// workers bump the same atomics, so their traffic counts too.
-    fn data_packets(&self) -> u64 {
-        self.dp
-            .tunnels
-            .iter()
-            .filter(|&(&nid, _)| nid != self.myself)
-            .map(|(_, t)| t.stats.in_packets() + t.stats.out_packets())
-            .sum()
-    }
-
     /// Arm the periodic timers and dial every outgoing slot.
     pub(super) fn ondemand_wake(&mut self, why: &str) {
         let now = self.timers.now();
-        let seen = self.data_packets();
         let Some(od) = self.ondemand.as_mut() else {
             return;
         };
@@ -114,7 +134,7 @@ impl Daemon {
         od.asleep = false;
         od.woke_at = now;
         od.last_active = now;
-        od.seen_packets = seen;
+        od.local_activity = false;
         let check = self.idle_check_interval();
         if let Some(od) = &self.ondemand {
             self.timers.set(&od.idle_timer, check);
@@ -246,16 +266,17 @@ impl Daemon {
         Duration::from_secs(u64::from(self.settings.idle_timeout / 4).max(1))
     }
 
+    /// Sleep once the device has initiated nothing for `IdleTimeout`.
+    /// Inbound traffic does not count: an unsolicited packet from the
+    /// mesh (scanner, stray broadcast) must not keep the radio up.
     pub(super) fn on_ondemand_idle(&mut self) {
         let now = self.timers.now();
-        let seen = self.data_packets();
         let idle = Duration::from_secs(u64::from(self.settings.idle_timeout));
         let check = self.idle_check_interval();
         let Some(od) = self.ondemand.as_mut() else {
             return;
         };
-        if seen != od.seen_packets || od.has_held() {
-            od.seen_packets = seen;
+        if mem::take(&mut od.local_activity) || od.has_held() {
             od.last_active = now;
         }
         let quiet = now.saturating_duration_since(od.last_active);
@@ -308,6 +329,11 @@ impl Daemon {
         }
         if self.ondemand.as_ref().is_some_and(|od| od.asleep) {
             self.ondemand_wake("packet from the device");
+        }
+        if initiates(data)
+            && let Some(od) = self.ondemand.as_mut()
+        {
+            od.note_local();
         }
         let now = self.timers.now();
         let Some(od) = self.ondemand.as_ref() else {
@@ -387,7 +413,7 @@ mod tests {
 
     #[test]
     fn only_unicast_wakes() {
-        assert!(wakes(&v4([10, 243, 0, 1])));
+        assert!(wakes(&v4([10, 66, 0, 1])));
         assert!(!wakes(&v4([224, 0, 0, 22])));
         assert!(!wakes(&v4([255, 255, 255, 255])));
         assert!(wakes(&v6([0x00, 0x42])));
@@ -395,5 +421,44 @@ mod tests {
         assert!(!wakes(&v6([0xfe, 0x80])));
         assert!(wakes(&v6([0xfe, 0xc0])));
         assert!(!wakes(&v4([10, 0, 0, 1])[..20]));
+    }
+
+    /// IPv4 frame (IHL 5) with `proto` and transport bytes `l4`.
+    fn v4_l4(proto: u8, l4: &[u8]) -> Vec<u8> {
+        let mut f = v4([10, 66, 0, 1]);
+        f[14] = 0x45;
+        f[23] = proto;
+        f.extend_from_slice(l4);
+        f
+    }
+
+    fn v6_l4(proto: u8, l4: &[u8]) -> Vec<u8> {
+        let mut f = v6([0x00, 0x42]);
+        f[20] = proto;
+        f.extend_from_slice(l4);
+        f
+    }
+
+    /// TCP header bytes with `flags` at offset 13.
+    fn tcp(flags: u8) -> Vec<u8> {
+        let mut h = vec![0u8; 20];
+        h[13] = flags;
+        h
+    }
+
+    #[test]
+    fn replies_to_unsolicited_traffic_are_not_activity() {
+        assert!(initiates(&v4_l4(1, &[8, 0])), "echo request");
+        assert!(!initiates(&v4_l4(1, &[0, 0])), "echo reply");
+        assert!(!initiates(&v4_l4(1, &[3, 3])), "port unreachable");
+        assert!(initiates(&v4_l4(17, &[0; 8])), "udp");
+        assert!(initiates(&v4_l4(6, &tcp(0x02))), "syn");
+        assert!(initiates(&v4_l4(6, &tcp(0x10))), "ack");
+        assert!(!initiates(&v4_l4(6, &tcp(0x14))), "rst");
+        assert!(!initiates(&v4_l4(6, &tcp(0x12))), "syn-ack");
+        assert!(initiates(&v6_l4(58, &[128, 0])), "v6 echo request");
+        assert!(!initiates(&v6_l4(58, &[129, 0])), "v6 echo reply");
+        assert!(!initiates(&v6_l4(58, &[1, 4])), "v6 unreachable");
+        assert!(!initiates(&v6_l4(6, &tcp(0x04))), "v6 rst");
     }
 }

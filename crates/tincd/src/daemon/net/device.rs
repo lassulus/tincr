@@ -197,6 +197,11 @@ impl Daemon {
                             // raw IP payload we got from the kernel.
                             let myself_tunnel = self.dp.tunnels.entry(self.myself).or_default();
                             myself_tunnel.stats.add_in(1, len as u64);
+                            // Bypasses `forward_packet`: an `OnDemand` daemon must still
+                            // see this (always locally sent TCP data) as activity.
+                            if let Some(od) = self.ondemand.as_mut() {
+                                od.note_local();
+                            }
 
                             // TSO is single-flow, so every chunk shares a destination and the route
                             // lookup amortises via `last_routes[]`; `forward_packet` still runs per
