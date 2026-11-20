@@ -553,8 +553,12 @@ impl Daemon {
     /// Network-came-back button (SIGALRM, `tinc retry`): zero outgoing backoff,
     /// fire retry timers now, and kick the ping sweep so connects stuck on a
     /// pre-suspend fd are reaped this turn. Otherwise a laptop suspended past
-    /// `MaxTimeout` waits up to 15 minutes.
+    /// `MaxTimeout` waits up to 15 minutes. A sleeping `OnDemand` daemon
+    /// has nothing to retry and stays asleep.
     pub(super) fn on_retry(&mut self) {
+        if self.ondemand.as_ref().is_some_and(|od| od.asleep) {
+            return;
+        }
         // Zero backoff and wake waiting slots. Dialing ones are left alone.
         for outgoing in self.outgoings.values_mut() {
             outgoing.timeout = 0;

@@ -298,12 +298,16 @@ pub static VARS: &[Var] = &[
     // HostsOverlayDirectory: second host dir for runtime writes when
     // hosts/ is read-only.
     v("HostsOverlayDirectory", S),
+    // OnDemand: dial only when the device has traffic; IdleTimeout
+    // puts it back to sleep.
+    v("OnDemand", S),
+    v("IdleTimeout", S),
 ];
 
 /// Tripwire: C tinc's table has 74 entries, plus our Rust-side keys.
 /// Drift in the 74 means a config key was added or removed in C tinc
 /// and this table is stale.
-const _: () = assert!(VARS.len() == 74 + 7);
+const _: () = assert!(VARS.len() == 74 + 9);
 
 /// Look up by name, case-insensitive. The `&'static` lets `cmd_config`
 /// canonicalise (`lookup("port")?.name == "Port"`) without cloning. Unknown

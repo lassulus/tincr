@@ -238,6 +238,13 @@ pub struct DaemonSettings {
     /// unreachable. For laptops that don't want a configured-but-
     /// unconnected tun0 hanging around. Non-reloadable.
     pub device_standby: bool,
+    /// `OnDemand` (Rust extension). No meta connections until the
+    /// device has a packet for the VPN; asleep again after
+    /// `idle_timeout`. Router mode only. Non-reloadable.
+    pub on_demand: bool,
+    /// `IdleTimeout` seconds without data traffic before an
+    /// `OnDemand` daemon goes back to sleep. Default 300.
+    pub idle_timeout: u32,
 
     /// `UPnP = yes|udponly|no`. When
     /// not `No`, spawns a background thread that asks the LAN gateway
@@ -312,6 +319,7 @@ impl DaemonSettings {
             "Proxy" => proxy,
             "UDPRcvBuf/UDPSndBuf/FWMark/BindToInterface" => sockopts,
             "DeviceStandby" => device_standby,
+            "OnDemand" => on_demand,
             "UPnP" => upnp,
             "UPnPDiscoverWait" => upnp_discover_wait,
             "UPnPRefreshPeriod" => upnp_refresh_period,
@@ -368,6 +376,8 @@ impl Default for DaemonSettings {
             global_pmtu: None,
             global_weight: None,
             device_standby: false,
+            on_demand: false,
+            idle_timeout: 300,
             upnp: UpnpMode::No,
             upnp_discover_wait: 5,
             upnp_refresh_period: 60,
@@ -404,6 +414,9 @@ fn parse_reloadable(config: &tinc_conf::Config, settings: &mut DaemonSettings) {
     cfg_int!(config, "Weight", i32, |v| settings.global_weight = Some(v));
     cfg_int!(config, "MaxTimeout", u32, |v| if v >= 1 {
         settings.maxtimeout = v.min(MAX_DURATION_SECS);
+    });
+    cfg_int!(config, "IdleTimeout", u32, |v| {
+        settings.idle_timeout = v.clamp(1, MAX_DURATION_SECS);
     });
     cfg_bool!(config, "DecrementTTL" => settings.decrement_ttl);
     cfg_bool!(config, "TunnelServer" => settings.tunnelserver);
@@ -705,6 +718,16 @@ pub(crate) fn load_settings(config: &tinc_conf::Config) -> Result<DaemonSettings
     // DeviceStandby. Non-reloadable: decides whether tinc-up
     // fires at setup vs first-peer.
     cfg_bool!(config, "DeviceStandby" => settings.device_standby);
+
+    // OnDemand. Non-reloadable: the timers start disarmed at setup.
+    cfg_bool!(config, "OnDemand" => settings.on_demand);
+    if settings.on_demand {
+        if settings.routing_mode != RoutingMode::Router {
+            return Err(SetupError::Config("OnDemand requires Mode = router".into()));
+        }
+        // Shard workers poll every 100 ms; asleep must mean asleep.
+        settings.shards.get_or_insert(1);
+    }
 
     // UPnP. Non-reloadable (thread spawned once at setup).
     if let Some(e) = config.lookup("UPnP").next() {

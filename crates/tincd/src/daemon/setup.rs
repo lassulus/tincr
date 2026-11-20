@@ -51,6 +51,7 @@ use crate::subnet_tree::SubnetTree;
 use super::DataPlane;
 use super::intervals::HOUSEKEEP_SWEEP;
 use super::intervals::PERIODIC_TICK;
+use super::ondemand::OnDemand;
 use super::settings::{
     DaemonSettings, RoutingMode, load_settings, parse_bind_addr, parse_connect_to_from_config,
     parse_subnets_from_config,
@@ -884,6 +885,8 @@ impl Daemon {
             log::info!(target: "tincd", "Invitation key loaded");
         }
 
+        let ondemand = settings.on_demand.then(|| OnDemand::new(&mut timers));
+
         log::info!(target: "tincd", "Ready");
 
         let mut daemon = Self {
@@ -974,6 +977,7 @@ impl Daemon {
             tx_snap: None,
             shards: shard_runtime,
             tunnel_handles: IntHashMap::default(),
+            ondemand,
         };
 
         // proxy host pre-resolve. Non-blocking; literal IPs
@@ -981,6 +985,10 @@ impl Daemon {
         // the very first dial without waiting one tick.
         daemon.request_proxy_resolve();
 
+        // Asleep from the start: `add_outgoing` below only registers.
+        if daemon.ondemand.is_some() {
+            daemon.ondemand_disarm_timers();
+        }
         for peer in connect_to {
             daemon.add_outgoing(peer, OutOrigin::ConfigConnectTo);
         }

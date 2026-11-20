@@ -461,15 +461,18 @@ impl Daemon {
         }
     }
 
-    /// New slot, dialled right away. The node goes into the graph first so
-    /// an `ADD_EDGE` arriving via another path can find it.
+    /// New slot, dialled right away unless `OnDemand` is asleep (the
+    /// wake dials it). The node goes into the graph first so an
+    /// `ADD_EDGE` arriving via another path can find it.
     pub(super) fn add_outgoing(&mut self, name: String, origin: OutOrigin) {
         self.lookup_or_add_node(&name);
         let addr_cache = AddressCache::open(&self.confbase, &name);
         let oid = self
             .outgoings
             .insert(Outgoing::new(name, origin, addr_cache));
-        self.setup_outgoing_connection(oid);
+        if !self.ondemand.as_ref().is_some_and(|od| od.asleep) {
+            self.setup_outgoing_connection(oid);
+        }
     }
 
     /// Backoff over, or `tinc retry`: dial now if the slot is waiting.

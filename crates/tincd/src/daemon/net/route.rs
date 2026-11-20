@@ -72,18 +72,27 @@ impl Daemon {
             return nw;
         }
 
-        // Close over node_ids+graph and gate on reachability.
-        // `myself` is always reachable, so the "only check reachable
-        // for REMOTE owners" falls out without an explicit string
-        // compare.
-        let node_ids = &self.node_ids;
-        let graph = &self.graph;
-        let result = route(data, &self.subnets, |name| {
-            let nid = *node_ids.get(name)?;
-            graph.node(nid).filter(|n| n.reachable).map(|_| nid)
-        });
+        let result = self.route_ip(data);
+        if from.is_none()
+            && self.ondemand.is_some()
+            && self.ondemand_intercept(&result, data, &mut nw)
+        {
+            return nw;
+        }
 
         nw | self.dispatch_route_result(result, data, from)
+    }
+
+    /// Router-mode `route()` over the live subnet table, gated on
+    /// reachability. `myself` is always reachable, so the "only check
+    /// reachable for REMOTE owners" falls out without a name compare.
+    pub(in crate::daemon) fn route_ip(&self, data: &[u8]) -> RouteResult<NodeId> {
+        let node_ids = &self.node_ids;
+        let graph = &self.graph;
+        route(data, &self.subnets, |name| {
+            let nid = *node_ids.get(name)?;
+            graph.node(nid).filter(|n| n.reachable).map(|_| nid)
+        })
     }
 
     /// The reachable owner `route()` would pick for `addr`, and its subnet.
@@ -317,7 +326,7 @@ impl Daemon {
 
     /// `RouteResult` dispatch. Shared by Router and Switch paths.
     #[expect(clippy::needless_pass_by_value)] // consumed by match (moves out NodeId from variants)
-    fn dispatch_route_result(
+    pub(in crate::daemon) fn dispatch_route_result(
         &mut self,
         result: RouteResult<NodeId>,
         data: &mut [u8],

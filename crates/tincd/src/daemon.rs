@@ -41,6 +41,7 @@ pub(crate) mod intervals;
 mod metaconn;
 pub(crate) mod net;
 pub use net::MAX_PENDING_META;
+mod ondemand;
 mod periodic;
 mod punch;
 mod purge;
@@ -145,6 +146,10 @@ pub enum TimerWhat {
     Punch(NodeId),
     /// One-shot: replay RST-killed punch dials from the same ports.
     PunchRedial(NodeId),
+    /// `OnDemand`: idle check while awake.
+    OnDemandIdle,
+    /// `OnDemand`: earliest held-packet deadline.
+    OnDemandHold,
 }
 
 /// TERM/QUIT/INT all map to Exit.
@@ -554,6 +559,9 @@ pub struct Daemon {
 
     /// Data-plane worker threads (`Shards > 1`); empty otherwise.
     pub(crate) shards: ShardRuntime,
+
+    /// `OnDemand = yes` sleep/wake state; `None` otherwise.
+    pub(crate) ondemand: Option<ondemand::OnDemand>,
 }
 
 impl Daemon {
@@ -756,6 +764,8 @@ impl Daemon {
                     TimerWhat::PunchRedial(nid) => {
                         self.on_punch_redial_timer(nid);
                     }
+                    TimerWhat::OnDemandIdle => self.on_ondemand_idle(),
+                    TimerWhat::OnDemandHold => self.ondemand_flush(),
                 }
             }
 
@@ -854,6 +864,14 @@ impl Daemon {
             // drain here. Once-per-turn batching is fine: log lines
             // accumulate in outbuf until the next WRITE event anyway.
             self.flush_log_tap();
+            // Held packets go once their route or key shows up.
+            if self
+                .ondemand
+                .as_ref()
+                .is_some_and(ondemand::OnDemand::has_held)
+            {
+                self.ondemand_flush();
+            }
         }
 
         log::info!(target: "tincd", "Terminating");

@@ -233,6 +233,27 @@ that answers
 from the subnet table.
 .It Va DNSSuffix Li = Ar DOMAIN Bq tincr extension
 Zone suffix for the stub resolver.
+.It Va OnDemand Li = yes | no Pq no Bq tincr extension
+Dial
+.Va ConnectTo
+peers only when the device has a unicast packet for the VPN, and hold
+packets that have no route or tunnel key yet (up to 10 seconds) instead
+of answering them with ICMP unreachable.
+After
+.Va IdleTimeout
+seconds without data traffic all meta connections are closed and no
+timers stay armed, so an idle daemon causes no wakeups and no packets.
+Traffic towards a sleeping node does not wake it.
+Router mode only; implies
+.Va Shards
+= 1 unless set.
+Combine with
+.Va AutoConnect
+= no.
+.It Va IdleTimeout Li = Ar SECONDS Pq 300 Bq tincr extension
+Data-traffic idle time after which an
+.Va OnDemand
+daemon goes back to sleep.
 .El
 .Ss Accepted but ignored
 The following server variables are recognised by the parser for

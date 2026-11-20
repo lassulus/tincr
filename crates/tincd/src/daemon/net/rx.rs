@@ -135,6 +135,8 @@ impl Daemon {
             }
             self.pending_meta += 1;
             log::info!(target: "tincd::conn", "Connection from {peer}");
+            // Its handshake needs the ping sweep's auth timeout.
+            self.ondemand_wake("incoming connection");
         }
     }
 
