@@ -8,57 +8,82 @@ subnets with ICMP net-unreachable locally. Phase 2 adds one cheap, kept-alive
 connection from the phone to a relay (`neoprism`, public, already a retiolum
 hub) that tells the phone "someone wants you".
 
+## 0. Wake channel vs. traffic paths
+
+The relay connection is **only** a doorbell. It never carries data and
+never serves as the phone's meta connection for normal operation:
+
+- **Meta connection when awake:** phase 1 behaviour, unchanged. On wake the
+  phone dials *all* its `ConnectTo` candidates at once and keeps the first
+  that completes the handshake (`ondemand_race_won`); the rest are dropped,
+  so there is one meta connection. Handshake RTT is the proximity measure:
+  at home the home server (LAN, ~1 ms) beats neoprism (tens of ms); on
+  mobile the nearest public node wins. If it dies, all candidates are raced
+  again. neoprism may be one of the candidates, without any preference.
+- **Data:** whatever tinc already does: per-peer SPTPS over direct UDP
+  (including `LocalDiscovery` to LAN addresses), relayed over the meta
+  path only until UDP is confirmed. Tests:
+  `netns::ondemand::ondemand_wake_prefers_near_peer` (near peer and far hub
+  both `ConnectTo`; only the near one is kept, RTT shows no detour) and
+  `netns::ondemand::ondemand_data_goes_direct` (only the far hub is a
+  `ConnectTo`; data to a LAN peer still goes direct over UDP).
+- **Wake channel:** a separate, permanently dormant connection to
+  neoprism, open the whole time the VPN is switched on, asleep or awake.
+  Keeping it independent of the sleep state keeps the state machine
+  simple; while the phone is awake nothing routes through it (below).
+
 ## 1. Where the relay lives
 
 ### Option A (recommended): a dormant meta connection inside tincd on the hub
 
-Before sleeping, the phone does not close its connection to the hub but
-demotes it:
-
-1. Phone sends a new request `DORMANT` (tincr extension, gated on an
-   `ConnOptions` bit negotiated in `ID`/`ACK`, so C tinc peers never see it).
-2. The hub keeps the connection and the phone's edges in the graph, so the
-   mesh still believes the phone is reachable *via the hub*. Every other node
-   keeps routing to the phone, and since the hub is the phone's only
-   neighbour, every `REQ_KEY` and every relayed data packet for the phone
-   reaches the hub.
-3. The hub stops forwarding gossip (`ADD_EDGE`/`DEL_EDGE`/`ADD_SUBNET`/…)
+1. The phone opens the wake channel to neoprism and sends a new request
+   `DORMANT` right after `ACK` (tincr extension, gated on a `ConnOptions`
+   bit negotiated in `ID`/`ACK`, so C tinc peers never see it).
+2. Neoprism announces the phone's edge on this connection with a
+   prohibitive weight (last resort). While the phone sleeps it has no other
+   edges, so the mesh routes to the phone via neoprism and every `REQ_KEY`
+   or relayed data packet for the phone reaches neoprism. While the phone is
+   awake its real meta connection gives normal-weight edges, so shortest
+   paths never use the dormant one. The phone itself keeps the wake channel
+   out of its own graph (no edge, no routing, no gossip).
+3. Neoprism stops forwarding gossip (`ADD_EDGE`/`DEL_EDGE`/`ADD_SUBNET`/…)
    and `KEY_CHANGED` to a dormant connection, and stops sending `PING` on it
    (liveness is the phone's job, see §3). This is the part that matters for
    battery: on retiolum the gossip churn alone would wake the phone every
    few seconds.
 4. Detection is free: the first `REQ_KEY` whose destination is the dormant
-   node, or the first data packet the hub would forward to it, is the wake
-   event. The hub forwards that `REQ_KEY` over the dormant connection
-   unchanged (it *is* the wake message) and queues data packets for the
-   phone for a few seconds, the same hold logic phase 1 uses on the phone
-   side (`daemon/ondemand.rs`).
-5. Phone-side, any line arriving on the dormant connection runs
-   `ondemand_wake`, then sends `RESUME`. The hub answers with the full state
-   dump it sends after `ACK` (`send_everything`) because the phone missed the
-   gossip while dormant, then treats the connection as a normal one again.
-   The waiting `REQ_KEY` is processed normally, so the sender's tunnel comes
-   up without waiting for its 10 s `REQ_KEY` retry.
+   node, or the first data packet neoprism would forward to it, is the wake
+   event. Neoprism sends one `WAKE <sender>` line on the dormant connection
+   (debounced) and holds data packets for the phone for a few seconds, like
+   phase 1's hold queue (`daemon/ondemand.rs`).
+5. The phone runs `ondemand_wake`: the normal race over its `ConnectTo`
+   candidates picks the closest meta peer; neoprism is not preferred. Once
+   the phone is reachable through that peer it sends its own `REQ_KEY` to
+   `<sender>`, so the sender's tunnel comes up without waiting for its 10 s
+   retry, and data goes direct over UDP where the NATs allow it. Packets
+   neoprism held are forwarded along the now-best route, which no longer
+   includes the dormant edge.
 
-Why this one: authentication, encryption, NAT traversal of the hub address
-and routing are all reused (the meta SPTPS session with the existing host
-keys); no proxy subnets; no second service to deploy; the hub knows exactly
-which node is dormant. Cost: neoprism must run tincr (only the hub; every
-other retiolum node is unchanged and may stay C tinc), and a small protocol
-extension (two requests plus an option bit).
+Why this one: authentication, encryption and NAT traversal to neoprism are
+reused (the meta SPTPS session with the existing host keys); no proxy
+subnets; no second service to deploy; neoprism knows exactly which node is
+dormant. Cost: neoprism must run tincr (every other retiolum node is
+unchanged and may stay C tinc), and a small protocol extension (`DORMANT`,
+`WAKE`, an option bit).
 
 Risks:
-- While dormant the phone looks reachable, so senders will try UDP to the
-  phone's last address. Those probes go nowhere until the wake; the hub's
-  relay path still works because the phone's only edge is to the hub.
-  Mitigation: before going dormant the phone re-announces its edge with the
-  `IndirectData` option, so senders relay via the hub from the first packet
-  instead of probing a dead UDP address.
-- The hub has to bound queued packets per dormant node (count and bytes)
-  and give up after ~10 s with ICMP unreachable, as phase 1 does.
+- SSSP ignores edges without a reverse, and the phone does not announce
+  the dormant edge itself. Neoprism therefore announces both directions of
+  it, flagged `IndirectData` and with the prohibitive weight, so senders
+  relay to the sleeping phone via neoprism from the first packet instead of
+  probing a stale UDP address. When the phone wakes and its own edges
+  appear, those win and senders switch to direct UDP.
+- Neoprism must bound held packets per dormant node (count and bytes) and
+  give up after ~10 s with ICMP unreachable, as phase 1 does.
 - A sender spraying traffic at a sleeping phone keeps it awake. That is the
-  point of the feature, but the phone's `IdleTimeout` should count only
-  traffic that actually flows, which phase 1 already does.
+  point of the feature; `IdleTimeout` counts only traffic that flows.
+- Neoprism down: incoming wake-ups fail, outgoing traffic is unaffected
+  (the race just never picks neoprism).
 
 ### Option B: a separate tiny wake service on neoprism
 
@@ -80,20 +105,21 @@ subnets if the distributed `hosts/neoprism` contains them; two places to
 configure per phone; a second daemon to run; packets that arrive before the
 wake are lost unless the service re-injects them.
 
-## 2. How the hub detects traffic for a dormant node
+## 2. How neoprism detects traffic for a dormant node
 
-Option A: in the hub's tincd, at the two places a packet or key request is
+Option A: in neoprism's tincd, at the two places a packet or key request is
 forwarded towards a node: `send_sptps_packet`/`send_sptps_data_relay`
 (data) and the `REQ_KEY` forward in `daemon/gossip/keys.rs`. If the next
-hop's connection is dormant: wake it (once, debounced), then queue the
-packet or pass the `REQ_KEY` through. Nothing on the hub polls.
+hop's connection is dormant: send `WAKE <sender>` (once, debounced), then
+hold the packet or drop the `REQ_KEY` (the phone re-initiates it). Nothing
+on neoprism polls.
 
 Option B: the kernel routes to `wake0`; the service blocks in `read()`.
 
 ## 3. Keepalive interval vs. NAT / carrier timeouts
 
-The connection is phone → hub TCP (the existing meta connection in A). Both
-ends of it must survive the carrier's NAT/firewall idle timeout:
+The wake channel is phone → neoprism TCP. Both ends of it must survive the
+carrier's NAT/firewall idle timeout:
 
 - RFC 5382 asks NATs to keep established TCP mappings for at least 2 h 4 min,
   but carrier-grade NATs often expire them after minutes; reported values
@@ -108,7 +134,7 @@ ends of it must survive the carrier's NAT/firewall idle timeout:
 - Start at 25 min, then adapt per network: if the connection dies before the
   next alarm, halve the interval for
   that network (keyed by `Network` / Wi-Fi SSID / carrier), floor 9 min; after
-  a few successful rounds probe longer again. The hub must accept a dormant
+  a few successful rounds probe longer again. Neoprism must accept a dormant
   connection silent for up to ~2× the maximum interval instead of its usual
   `PingTimeout`.
 - On network change (`ConnectivityManager` callback) the dormant connection
@@ -129,7 +155,7 @@ ends of it must survive the carrier's NAT/firewall idle timeout:
   which is exactly how FCM delivers pushes; nothing else has to stay awake.
 - Wake locks are ignored in Doze; tincd doesn't need one while blocked. After
   a wake, the app should hold a partial wake lock for the few seconds the
-  connection setup takes, released when tincd reports a connected hub.
+  race and key exchange take, released when tincd reports a meta peer.
 - tincd is a child process of the app's UID, so it gets the same network
   policy as the app.
 
@@ -148,22 +174,27 @@ Order of magnitude, cellular, screen off:
   per active tunnel plus retiolum gossip; each of those restarts the radio
   tail, so the radio effectively never reaches idle. That is tens of percent
   per day, matching the reported drain.
-- Waking for real traffic costs one meta handshake plus a full state dump
-  (retiolum: a few hundred `ADD_EDGE`/`ADD_SUBNET` lines, tens of KB),
-  then `IdleTimeout` of normal operation.
+- Waking for real traffic costs a short race (one TCP+SPTPS handshake per
+  `ConnectTo` candidate, all but the winner cut off; keep the candidate
+  list short), one full state dump from the winner (retiolum: a few hundred
+  `ADD_EDGE`/`ADD_SUBNET` lines, tens of KB), then `IdleTimeout` of normal
+  operation with data on direct UDP.
 
 ## 6. Work items (for when this gets built)
 
-1. Protocol: option bit + `DORMANT`/`RESUME` requests, documented in
+1. Protocol: option bit + `DORMANT`/`WAKE` requests, documented in
    `docs/PROTOCOL.md`; C tinc never receives them.
-2. Hub: per-connection dormant flag; gossip and `PING` suppression; wake
-   hooks at the two forward sites; per-node bounded queue; long liveness
-   window.
-3. Phone daemon: `ondemand_sleep` demotes the hub connection instead of
-   closing it; any input on it wakes; `RESUME` handling; a control request
-   "send keepalive now".
+2. neoprism: per-connection dormant flag; gossip and `PING` suppression;
+   both-direction last-resort edge; wake hooks at the two forward sites;
+   per-node bounded queue; long liveness window.
+3. Phone daemon: a `WakeRelay = neoprism` option that opens the dormant
+   connection outside the `ConnectTo` race and outside its graph; `WAKE`
+   runs `ondemand_wake` and queues a `REQ_KEY` to the sender; a control
+   request "send keepalive now".
 4. App: `setExactAndAllowWhileIdle` keepalive alarm with adaptive interval;
    redial on network change; short wake lock after wake.
-5. Tests: netns test with a third node pinging the sleeping phone through
-   the hub (first ping succeeds), and a test that gossip churn on the hub
-   produces zero packets to the dormant phone.
+5. Tests (netns): a third node pings the sleeping phone through neoprism
+   and the first ping succeeds; with a near `ConnectTo` peer present the
+   woken phone's meta connection is the near peer and the ping RTT shows no
+   detour via neoprism; gossip churn on neoprism produces zero packets on
+   the dormant connection.
