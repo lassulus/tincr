@@ -1,0 +1,43 @@
+# Release-branch only: signed tincr-ondemand APK as a GitHub release
+# (one new tag per build, so Obtainium sees each update).
+name: android-ondemand-release
+on:
+  push:
+    branches: [release/android-ondemand]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build unsigned release APK
+        run: |
+          nix build --impure -L -o result --expr '
+            let f = builtins.getFlake (toString ./.); in
+            import ./nix/android-ondemand-release.nix {
+              tincr-ondemand-app = f.packages.x86_64-linux.tincr-ondemand-app;
+              versionCode = ${{ github.run_number }};
+            }'
+      - name: Sign
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          nix run nixpkgs#apksigner -- sign --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KS_ALIAS" --ks-pass env:KS_PASS \
+            --out tincr-ondemand.apk result/tincr-ondemand-unsigned.apk
+          nix run nixpkgs#apksigner -- verify --print-certs tincr-ondemand.apk
+          rm "$RUNNER_TEMP/release.jks"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "tincr-ondemand-v${{ github.run_number }}" tincr-ondemand.apk \
+            --target "$GITHUB_SHA" --latest \
+            --title "tincr on-demand v${{ github.run_number }}" \
+            --notes "Built from $GITHUB_SHA."
