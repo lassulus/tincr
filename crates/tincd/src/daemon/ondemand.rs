@@ -19,8 +19,11 @@ use crate::graph::NodeId;
 use crate::outgoing::{OutOrigin, OutState, Outgoing, OutgoingId};
 use crate::packet::{ETH_P_IP, ETH_P_IPV6, ethertype};
 use crate::route_decide::RouteResult;
+use crate::subnet_tree::SubnetTree;
 use crate::tunnel::TunnelState;
 use slotmap::SlotMap;
+use std::net::Ipv4Addr;
+use tinc_proto::Subnet;
 
 /// How long a packet waits for its route and tunnel key. Covers a meta
 /// handshake plus `REQ_KEY` over a slow mobile link; past it the packet
@@ -40,9 +43,9 @@ pub(crate) struct OnDemand {
     pub(crate) asleep: bool,
     idle_timer: TimerHandle,
     hold_timer: TimerHandle,
-    /// Set by a device packet that [`initiates`] traffic, cleared by
-    /// the idle check; `last_active` is when it was last seen set.
-    local_activity: bool,
+    /// Set by a directed unicast packet in either direction ([`unicast`]),
+    /// cleared by the idle check; `last_active` is when it was last seen.
+    activity: bool,
     last_active: Instant,
     /// Start of the window in which unroutable packets are held.
     woke_at: Instant,
@@ -56,7 +59,7 @@ impl OnDemand {
             asleep: true,
             idle_timer: timers.add(TimerWhat::OnDemandIdle),
             hold_timer: timers.add(TimerWhat::OnDemandHold),
-            local_activity: false,
+            activity: false,
             last_active: now,
             woke_at: now,
             held: VecDeque::new(),
@@ -67,48 +70,38 @@ impl OnDemand {
         !self.held.is_empty()
     }
 
-    /// The device sent traffic of its own (TSO path, already known TCP data).
-    pub(crate) fn note_local(&mut self) {
-        self.local_activity = true;
+    /// Directed unicast passed through ([`unicast`]); keeps it awake.
+    pub(crate) fn note_activity(&mut self) {
+        self.activity = true;
     }
 }
 
-/// Whether a router-mode frame from the device wakes the daemon: unicast
-/// only, so multicast and link-local noise (MLD, router solicitations) does not.
-fn wakes(data: &[u8]) -> bool {
+/// Whether a router-mode frame has a directed unicast destination: not
+/// multicast (`224/4`, `ff00::/8`), `255.255.255.255`, the broadcast address of
+/// a known IPv4 subnet, or IPv6 link-local. Only these wake an `OnDemand`
+/// daemon or keep it awake, in either direction, so multicast discovery
+/// (SSDP, MLD, LAN sync beacons) on a busy mesh cannot.
+pub(crate) fn unicast(data: &[u8], subnets: &SubnetTree) -> bool {
     match ethertype(data) {
-        // 224/4 multicast and above (240/4, 255.255.255.255).
-        Some(ETH_P_IP) => matches!(data.get(30..34), Some(&[a, ..]) if a < 224),
+        Some(ETH_P_IP) => {
+            let Some(&[a, b, c, d]) = data.get(30..34) else {
+                return false;
+            };
+            let dst = Ipv4Addr::new(a, b, c, d);
+            // 224/4 multicast and above (240/4, 255.255.255.255); an
+            // ownerless subnet is a `BroadcastSubnet`.
+            a < 224
+                && !subnets.lookup_ipv4(dst, |_| true).is_some_and(|(s, owner)| {
+                    owner.is_none()
+                        || matches!(*s, Subnet::V4 { addr, prefix, .. }
+                            if prefix <= 30 && dst.to_bits() == addr.to_bits() | (u32::MAX >> prefix))
+                })
+        }
         // ff00::/8 multicast, fe80::/10 link-local.
         Some(ETH_P_IPV6) => {
             matches!(data.get(38..40), Some(&[a, b]) if a != 0xff && !(a == 0xfe && b & 0xc0 == 0x80))
         }
         _ => false,
-    }
-}
-
-/// Whether a unicast device packet is traffic the host initiated, as
-/// opposed to its stack answering something unsolicited from the mesh
-/// (echo reply, ICMP error, TCP RST or SYN-ACK). Only these keep an
-/// `OnDemand` daemon awake, so scanners cannot.
-fn initiates(data: &[u8]) -> bool {
-    let (proto, l4) = match ethertype(data) {
-        Some(ETH_P_IP) => {
-            let ihl = data.get(14).map_or(20, |b| usize::from(b & 0x0f) * 4);
-            (data.get(23).copied(), 14 + ihl)
-        }
-        Some(ETH_P_IPV6) => (data.get(20).copied(), 54),
-        _ => return false,
-    };
-    let byte = |off: usize| data.get(l4 + off).copied();
-    match proto {
-        // Echo reply, unreachable, time exceeded, parameter problem.
-        Some(1) => !matches!(byte(0), Some(0 | 3 | 11 | 12)),
-        // ICMPv6 errors 1..=4 and echo reply.
-        Some(58) => !matches!(byte(0), Some(1..=4 | 129)),
-        // RST, or SYN+ACK.
-        Some(6) => !byte(13).is_some_and(|f| f & 0x04 != 0 || f & 0x12 == 0x12),
-        _ => true,
     }
 }
 
@@ -134,7 +127,7 @@ impl Daemon {
         od.asleep = false;
         od.woke_at = now;
         od.last_active = now;
-        od.local_activity = false;
+        od.activity = false;
         let check = self.idle_check_interval();
         if let Some(od) = &self.ondemand {
             self.timers.set(&od.idle_timer, check);
@@ -266,9 +259,19 @@ impl Daemon {
         Duration::from_secs(u64::from(self.settings.idle_timeout / 4).max(1))
     }
 
-    /// Sleep once the device has initiated nothing for `IdleTimeout`.
-    /// Inbound traffic does not count: an unsolicited packet from the
-    /// mesh (scanner, stray broadcast) must not keep the radio up.
+    /// A peer's packet was delivered to the device; directed unicast
+    /// (not multicast or broadcast) counts as activity.
+    pub(super) fn ondemand_inbound(&mut self, frame: &[u8]) {
+        if let Some(od) = self.ondemand.as_mut()
+            && unicast(frame, &self.subnets)
+        {
+            od.note_activity();
+        }
+    }
+
+    /// Sleep after `IdleTimeout` without directed unicast in either
+    /// direction. Multicast and broadcast (discovery beacons, MLD, SSDP)
+    /// never count, so a chatty mesh cannot keep the radio up.
     pub(super) fn on_ondemand_idle(&mut self) {
         let now = self.timers.now();
         let idle = Duration::from_secs(u64::from(self.settings.idle_timeout));
@@ -276,7 +279,7 @@ impl Daemon {
         let Some(od) = self.ondemand.as_mut() else {
             return;
         };
-        if mem::take(&mut od.local_activity) || od.has_held() {
+        if mem::take(&mut od.activity) || od.has_held() {
             od.last_active = now;
         }
         let quiet = now.saturating_duration_since(od.last_active);
@@ -324,16 +327,14 @@ impl Daemon {
         data: &[u8],
         nw: &mut bool,
     ) -> bool {
-        if !wakes(data) {
+        if !unicast(data, &self.subnets) {
             return false;
         }
         if self.ondemand.as_ref().is_some_and(|od| od.asleep) {
             self.ondemand_wake("packet from the device");
         }
-        if initiates(data)
-            && let Some(od) = self.ondemand.as_mut()
-        {
-            od.note_local();
+        if let Some(od) = self.ondemand.as_mut() {
+            od.note_activity();
         }
         let now = self.timers.now();
         let Some(od) = self.ondemand.as_ref() else {
@@ -411,54 +412,36 @@ mod tests {
         f
     }
 
-    #[test]
-    fn only_unicast_wakes() {
-        assert!(wakes(&v4([10, 66, 0, 1])));
-        assert!(!wakes(&v4([224, 0, 0, 22])));
-        assert!(!wakes(&v4([255, 255, 255, 255])));
-        assert!(wakes(&v6([0x00, 0x42])));
-        assert!(!wakes(&v6([0xff, 0x02])));
-        assert!(!wakes(&v6([0xfe, 0x80])));
-        assert!(wakes(&v6([0xfe, 0xc0])));
-        assert!(!wakes(&v4([10, 0, 0, 1])[..20]));
-    }
-
-    /// IPv4 frame (IHL 5) with `proto` and transport bytes `l4`.
-    fn v4_l4(proto: u8, l4: &[u8]) -> Vec<u8> {
-        let mut f = v4([10, 66, 0, 1]);
-        f[14] = 0x45;
-        f[23] = proto;
-        f.extend_from_slice(l4);
-        f
-    }
-
-    fn v6_l4(proto: u8, l4: &[u8]) -> Vec<u8> {
-        let mut f = v6([0x00, 0x42]);
-        f[20] = proto;
-        f.extend_from_slice(l4);
-        f
-    }
-
-    /// TCP header bytes with `flags` at offset 13.
-    fn tcp(flags: u8) -> Vec<u8> {
-        let mut h = vec![0u8; 20];
-        h[13] = flags;
-        h
+    /// The tree a node sees: its own /32, a /16 owned by a peer, and the
+    /// built-in broadcast subnets.
+    fn tree() -> SubnetTree {
+        let mut t = SubnetTree::new();
+        t.add("10.66.42.42/32".parse().unwrap(), "phone".into());
+        t.add("10.66.0.0/16".parse().unwrap(), "hub".into());
+        for s in ["255.255.255.255", "224.0.0.0/4", "ff00::/8"] {
+            t.add_broadcast(s.parse().unwrap());
+        }
+        t
     }
 
     #[test]
-    fn replies_to_unsolicited_traffic_are_not_activity() {
-        assert!(initiates(&v4_l4(1, &[8, 0])), "echo request");
-        assert!(!initiates(&v4_l4(1, &[0, 0])), "echo reply");
-        assert!(!initiates(&v4_l4(1, &[3, 3])), "port unreachable");
-        assert!(initiates(&v4_l4(17, &[0; 8])), "udp");
-        assert!(initiates(&v4_l4(6, &tcp(0x02))), "syn");
-        assert!(initiates(&v4_l4(6, &tcp(0x10))), "ack");
-        assert!(!initiates(&v4_l4(6, &tcp(0x14))), "rst");
-        assert!(!initiates(&v4_l4(6, &tcp(0x12))), "syn-ack");
-        assert!(initiates(&v6_l4(58, &[128, 0])), "v6 echo request");
-        assert!(!initiates(&v6_l4(58, &[129, 0])), "v6 echo reply");
-        assert!(!initiates(&v6_l4(58, &[1, 4])), "v6 unreachable");
-        assert!(!initiates(&v6_l4(6, &tcp(0x04))), "v6 rst");
+    fn only_directed_unicast_counts() {
+        let t = tree();
+        assert!(unicast(&v4([10, 66, 42, 42]), &t));
+        assert!(unicast(&v4([10, 66, 0, 1]), &t));
+        assert!(
+            unicast(&v4([192, 0, 2, 1]), &t),
+            "unknown dst is still unicast"
+        );
+        assert!(!unicast(&v4([10, 66, 255, 255]), &t), "subnet broadcast");
+        assert!(!unicast(&v4([224, 0, 0, 22]), &t), "IGMP");
+        assert!(!unicast(&v4([239, 255, 255, 250]), &t), "SSDP");
+        assert!(!unicast(&v4([255, 255, 255, 255]), &t));
+        assert!(unicast(&v6([0x00, 0x42]), &t));
+        assert!(!unicast(&v6([0xff, 0x12]), &t), "LAN discovery multicast");
+        assert!(!unicast(&v6([0xff, 0x02]), &t), "MLD");
+        assert!(!unicast(&v6([0xfe, 0x80]), &t), "link-local");
+        assert!(unicast(&v6([0xfe, 0xc0]), &t));
+        assert!(!unicast(&v4([10, 0, 0, 1])[..20], &t), "truncated");
     }
 }

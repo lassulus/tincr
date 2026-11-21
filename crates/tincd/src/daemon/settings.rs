@@ -725,8 +725,12 @@ pub(crate) fn load_settings(config: &tinc_conf::Config) -> Result<DaemonSettings
         if settings.routing_mode != RoutingMode::Router {
             return Err(SetupError::Config("OnDemand requires Mode = router".into()));
         }
-        // Shard workers poll every 100 ms; asleep must mean asleep.
-        settings.shards.get_or_insert(1);
+        // Shard workers poll every 100 ms (asleep must mean asleep) and
+        // deliver packets past the idle accounting.
+        if settings.shards.is_some_and(|n| n > 1) {
+            log::warn!(target: "tincd", "OnDemand: ignoring Shards, using 1");
+        }
+        settings.shards = Some(1);
     }
 
     // UPnP. Non-reloadable (thread spawned once at setup).

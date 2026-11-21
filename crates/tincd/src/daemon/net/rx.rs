@@ -286,6 +286,9 @@ impl Daemon {
                 && let Some(frame) = rx_fast_scratch.get_mut(..len)
             {
                 target.handles.stats.add_in(1, len as u64);
+                if self.ondemand.is_some() {
+                    self.ondemand_inbound(frame);
+                }
                 // Consumed; the replay window advanced so the slow path won't see it. GRO
                 // offer or TUN write inline. Without GRO (Darwin utun) use `write_stage` so
                 // the batch ships in one `sendmsg_x`; elsewhere that is plain `write`.

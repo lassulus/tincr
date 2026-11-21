@@ -248,7 +248,7 @@ Data still goes directly over UDP to its destination wherever possible.
 If that connection fails, all peers are raced again.
 After
 .Va IdleTimeout
-seconds without traffic initiated by the device all meta connections are closed and no
+seconds without directed unicast traffic all meta connections are closed and no
 timers stay armed, so an idle daemon causes no wakeups and no packets.
 Traffic towards a sleeping node does not wake it.
 Router mode only; implies
@@ -258,12 +258,16 @@ Combine with
 .Va AutoConnect
 = no.
 .It Va IdleTimeout Li = Ar SECONDS Pq 300 Bq tincr extension
-Seconds in which the device initiated no traffic after which an
+Seconds without directed unicast traffic, in either direction, after
+which an
 .Va OnDemand
 daemon goes back to sleep.
-Inbound packets and the device's replies to them (echo replies, ICMP
-errors, TCP RST and SYN-ACK) do not count, so unsolicited traffic from
-the mesh cannot keep it awake.
+Packets from the device count, and packets from peers addressed to one of
+this node's subnets.
+Multicast and broadcast (224.0.0.0/4, 255.255.255.255, the broadcast
+address of a known subnet, ff00::/8) and IPv6 link-local never count
+and never wake the daemon, so discovery chatter on the mesh cannot keep
+it awake.
 .El
 .Ss Accepted but ignored
 The following server variables are recognised by the parser for

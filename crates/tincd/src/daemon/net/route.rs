@@ -334,6 +334,9 @@ impl Daemon {
     ) -> bool {
         match result {
             RouteResult::Forward { to } if to == self.myself => {
+                if from.is_some() && self.ondemand.is_some() {
+                    self.ondemand_inbound(data);
+                }
                 self.send_packet_myself(data);
                 false
             }

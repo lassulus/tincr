@@ -127,34 +127,39 @@ fn ondemand_traffic_keeps_awake() {
     assert!(!alice_log.contains("going to sleep"), "{alice_log}");
 }
 
-/// bob keeps pinging alice and sending UDP to a closed port. alice only
-/// answers (echo replies, port unreachable), so she still goes to sleep.
-#[test]
-fn ondemand_unsolicited_inbound_does_not_keep_awake() {
-    let Some(netns) = enter_netns("ondemand::ondemand_unsolicited_inbound_does_not_keep_awake")
-    else {
-        return;
-    };
-    let tmp = tmp!("ondemand-inbound");
-    let pair = ondemand_pair(netns, &tmp);
-    first_ping_ok(&pair.alice, &pair.bob);
-    let (in_before, _) = TunPair::traffic(&pair.alice);
-
-    let script = "while :; do ping -c 1 -W 1 10.42.0.1 >/dev/null; \
-                  echo x > /dev/udp/10.42.0.1/9; sleep 0.3; done";
-    let _noise = KillOnDrop(
+/// Runs `script` in bob's netns until dropped, after checking that what
+/// it sends reaches alice (her packet counter for bob grows).
+fn bob_sends(pair: &TunPair, script: &str) -> KillOnDrop {
+    let (before, _) = TunPair::traffic(&pair.alice);
+    let child = KillOnDrop(
         Command::new("ip")
             .args(["netns", "exec", "bobside", "bash", "-c", script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn noise"),
+            .expect("spawn sender"),
     );
     thread::sleep(Duration::from_secs(1));
-    let (in_noise, _) = TunPair::traffic(&pair.alice);
-    assert!(
-        in_noise >= in_before + 3,
-        "noise not delivered: {in_before} -> {in_noise}"
+    let (after, _) = TunPair::traffic(&pair.alice);
+    assert!(after >= before + 3, "not delivered: {before} -> {after}");
+    child
+}
+
+/// Multicast discovery chatter from a peer (SSDP- and IGMP-like) is
+/// delivered but does not keep alice awake.
+#[test]
+fn ondemand_multicast_does_not_keep_awake() {
+    let Some(netns) = enter_netns("ondemand::ondemand_multicast_does_not_keep_awake") else {
+        return;
+    };
+    let tmp = tmp!("ondemand-mcast");
+    let pair = ondemand_pair(netns, &tmp);
+    first_ping_ok(&pair.alice, &pair.bob);
+    run_ip_in("bobside", &["route", "add", "224.0.0.0/4", "dev", "tinc1"]);
+    let _chatter = bob_sends(
+        &pair,
+        "while :; do echo x > /dev/udp/239.255.255.250/1900; \
+         echo x > /dev/udp/224.0.0.22/9; sleep 0.3; done",
     );
     // IdleTimeout = 3, checked every second.
     let slept = try_poll(Duration::from_secs(8), || {
@@ -162,11 +167,32 @@ fn ondemand_unsolicited_inbound_does_not_keep_awake() {
     });
     assert!(
         slept.is_some(),
-        "inbound noise kept alice awake\n{}",
+        "multicast kept alice awake\n{}",
         pair.alice.log()
     );
     let (alice_log, _) = pair.finish();
     assert!(alice_log.contains("going to sleep"), "{alice_log}");
+}
+
+/// Directed unicast from a peer (pings to alice's own address) keeps
+/// alice awake past `IdleTimeout`. Her kernel ignores echo requests,
+/// so she sends nothing and only the inbound side is counted.
+#[test]
+fn ondemand_directed_unicast_keeps_awake() {
+    let Some(netns) = enter_netns("ondemand::ondemand_directed_unicast_keeps_awake") else {
+        return;
+    };
+    let tmp = tmp!("ondemand-ucast");
+    let pair = ondemand_pair(netns, &tmp);
+    first_ping_ok(&pair.alice, &pair.bob);
+    fs::write("/proc/sys/net/ipv4/icmp_echo_ignore_all", "1").expect("netns sysctl");
+    let pings = bob_sends(&pair, "exec ping -i 0.3 10.42.0.1");
+    // Twice the timeout.
+    thread::sleep(Duration::from_secs(6));
+    assert!(pair.alice.has_active_peer("bob"), "{}", pair.alice.log());
+    drop(pings);
+    let (alice_log, _) = pair.finish();
+    assert!(!alice_log.contains("going to sleep"), "{alice_log}");
 }
 
 /// Context switches of every thread of `pid`.
