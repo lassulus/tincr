@@ -57,52 +57,59 @@ ports or prefixes:
 
 ### Option A (recommended): a dormant meta connection inside tincd on the relay
 
+**Wake rule (same as phase 1's idle rule):** only directed unicast addressed
+to one of the sleeping node's subnets wakes it. Multicast and broadcast
+(`224.0.0.0/4`, `255.255.255.255`, a known subnet's broadcast address,
+`ff00::/8`) and IPv6 link-local never do. On a real mesh the steady
+unsolicited traffic is exactly that kind (LAN-sync discovery beacons, SSDP,
+IGMP, MLD), so anything else would wake the phone every 30 s.
+
+This rules out waking on a `REQ_KEY` or on relayed tunnel data: per-peer
+data is SPTPS-encrypted end to end between sender and phone, so a relay
+that only forwards cannot see the inner destination, and a sender's key
+exchange may have been triggered by a broadcast. The relay must therefore
+terminate the traffic itself while the phone sleeps:
+
 1. The phone opens the wake channel to the relay and sends a new request
    `DORMANT` right after `ACK` (tincr extension, gated on a `ConnOptions`
-   bit negotiated in `ID`/`ACK`, so C tinc peers never see it).
-2. The relay announces the phone's edge on this connection with a
-   prohibitive weight (last resort). While the phone sleeps it has no other
-   edges, so the mesh routes to the phone via the relay and every `REQ_KEY`
-   or relayed data packet for the phone reaches the relay. While the phone is
-   awake its real meta connection gives normal-weight edges, so shortest
-   paths never use the dormant one. The phone itself keeps the wake channel
-   out of its own graph (no edge, no routing, no gossip).
-3. The relay stops forwarding gossip (`ADD_EDGE`/`DEL_EDGE`/`ADD_SUBNET`/…)
-   and `KEY_CHANGED` to a dormant connection, and stops sending `PING` on it
-   (liveness is the phone's job, see §3). This is the part that matters for
-   battery: on a large mesh the gossip churn alone would wake the phone every
-   few seconds.
-4. Detection is free: the first `REQ_KEY` whose destination is the dormant
-   node, or the first data packet the relay would forward to it, is the wake
-   event. The relay sends one `WAKE <sender>` line on the dormant connection
-   (debounced) and holds data packets for the phone for a few seconds, like
-   phase 1's hold queue (`daemon/ondemand.rs`).
+   bit negotiated in `ID`/`ACK`, so C tinc peers never see it). The relay
+   adds no edge for this connection; the phone keeps it out of its own
+   graph too.
+2. While the phone sleeps (no edges), the relay announces the phone's
+   subnets as its own with a high weight (fallback subnets, the same
+   mechanism as `Subnet = ADDR#WEIGHT`). Senders route packets for the
+   phone's addresses to the relay over their normal tunnel with it, so the
+   relay decrypts them and sees the destination. When the phone is awake
+   its own, lower-weight announcements win and nothing goes to the relay.
+3. Multicast and broadcast reach the relay over tinc's broadcast path like
+   any node. The relay never forwards them over a dormant connection and
+   never treats them as a wake event.
+4. Wake: a packet routed to one of the fallback subnets whose destination
+   is directed unicast (the phase 1 `unicast()` check) makes the relay send
+   one `WAKE` line on the dormant connection (debounced) and hold the packet
+   (bounded, ~10 s, like phase 1's hold queue). Anything else for those
+   subnets is dropped; nothing on the relay polls.
 5. The phone runs `ondemand_wake`: the normal race over its `ConnectTo`
-   candidates picks the closest meta peer; the relay is not preferred. Once
-   the phone is reachable through that peer it sends its own `REQ_KEY` to
-   `<sender>`, so the sender's tunnel comes up without waiting for its 10 s
-   retry, and data goes direct over UDP where the NATs allow it. Packets
-   the relay held are forwarded along the now-best route, which no longer
-   includes the dormant edge.
+   candidates picks the closest meta peer; the relay is not preferred. The
+   phone's subnets come back with their normal weight, the relay withdraws
+   its fallback subnets, forwards what it held along the now-best route,
+   and senders switch to the phone itself (direct UDP where NATs allow).
 
 Why this one: authentication, encryption and NAT traversal to the relay are
-reused (the meta SPTPS session with the existing host keys); no proxy
-subnets; no second service to deploy; the relay knows exactly which node is
-dormant. Cost: the relay must run tincr (every other node is
-unchanged and may stay C tinc), and a small protocol extension (`DORMANT`,
-`WAKE`, an option bit).
+reused (the meta SPTPS session with the existing host keys); no second
+service to deploy; the relay knows exactly which node is dormant. Cost: the
+relay must run tincr (every other node is unchanged and may stay C tinc),
+and a small protocol extension (`DORMANT`, `WAKE`, an option bit).
 
 Risks:
-- SSSP ignores edges without a reverse, and the phone does not announce
-  the dormant edge itself. The relay therefore announces both directions of
-  it, flagged `IndirectData` and with the prohibitive weight, so senders
-  reach the sleeping phone through the relay from the first packet instead of
-  probing a stale UDP address. When the phone wakes and its own edges
-  appear, those win and senders switch to direct UDP.
+- Nodes with `StrictSubnets` only accept the relay's fallback subnets if
+  their copy of `hosts/RELAY` lists them (with the high weight). That is
+  configuration on those nodes, per phone; without it they cannot wake the
+  phone, nothing else breaks.
 - The relay must bound held packets per dormant node (count and bytes) and
   give up after ~10 s with ICMP unreachable, as phase 1 does.
-- A sender spraying traffic at a sleeping phone keeps it awake. That is the
-  point of the feature; `IdleTimeout` counts only traffic that flows.
+- A sender spraying directed unicast at a sleeping phone keeps it awake.
+  That is the point of the feature (lass's rule: directed traffic counts).
 - Relay down: incoming wake-ups fail, outgoing traffic is unaffected
   (the race just never picks the relay).
 
@@ -128,12 +135,11 @@ wake are lost unless the service re-injects them.
 
 ## 2. How the relay detects traffic for a dormant node
 
-Option A: in the relay's tincd, at the two places a packet or key request is
-forwarded towards a node: `send_sptps_packet`/`send_sptps_data_relay`
-(data) and the `REQ_KEY` forward in `daemon/gossip/keys.rs`. If the next
-hop's connection is dormant: send `WAKE <sender>` (once, debounced), then
-hold the packet or drop the `REQ_KEY` (the phone re-initiates it). Nothing
-on the relay polls.
+Option A: in the relay's tincd, where a packet is delivered to a subnet the
+relay owns: if it is a fallback subnet of a dormant node and the packet is
+directed unicast, send `WAKE` (once, debounced) and hold the packet;
+multicast and broadcast never reach this check because they take the
+broadcast path. Nothing on the relay polls.
 
 Option B: the kernel routes to `wake0`; the service blocks in `read()`.
 
@@ -207,17 +213,17 @@ Order of magnitude, cellular, screen off:
 1. Protocol: option bit + `DORMANT`/`WAKE` requests, documented in
    `docs/PROTOCOL.md`; C tinc never receives them.
 2. Relay: `WakeRelayFor`/`AcceptDormant` option (§0.1); per-connection
-   dormant flag; gossip and `PING` suppression; both-direction last-resort
-   edge; wake hooks at the two forward sites; per-node bounded queue; long
-   liveness window.
+   dormant flag; gossip and `PING` suppression; fallback subnets announced
+   while the node sleeps and withdrawn when it wakes; the directed-unicast
+   wake check and a per-node bounded hold queue; long liveness window.
 3. Phone daemon: the `WakeRelay` option (§0.1) that opens the dormant
    connection outside the `ConnectTo` race and outside its graph; `WAKE`
-   runs `ondemand_wake` and queues a `REQ_KEY` to the sender; a control
-   request "send keepalive now".
+   runs `ondemand_wake`; a control request "send keepalive now".
 4. App: `setExactAndAllowWhileIdle` keepalive alarm with adaptive interval;
    redial on network change; short wake lock after wake.
 5. Tests (netns): a third node pings the sleeping phone through the relay
    and the first ping succeeds; with a near `ConnectTo` peer present the
    woken phone's meta connection is the near peer and the ping RTT shows no
-   detour via the relay; gossip churn on the relay produces zero packets on
-   the dormant connection.
+   detour via the relay; multicast/broadcast (SSDP, IGMP, MLD, discovery
+   beacons) to the sleeping phone's network produce no `WAKE`; gossip churn
+   on the relay produces zero packets on the dormant connection.
